@@ -693,6 +693,8 @@ pub struct ProbeReport {
     pub fingerprint: String,
     /// 命中的填充层总数。
     pub total: usize,
+    /// 逐文件的命中数，与请求里的输入一一对应。
+    pub per_file: Vec<usize>,
 }
 
 /// 一次正在运行（或刚结束）的查找任务。
@@ -733,17 +735,21 @@ pub fn spawn_probe(request: Request, fingerprint: String, ctx: egui::Context) ->
 
 fn probe_all(request: &Request, fingerprint: &str) -> Result<ProbeReport, String> {
     let mut total = 0usize;
+    let mut per_file = Vec::with_capacity(request.inputs.len());
     for input in &request.inputs {
         let mut doc = pdfbatch_core::pdf::open(&input.path, request.password.as_deref())
             .map_err(|error| format!("{}：{error}", input.path.display()))?;
-        total += request
+        let hits = request
             .action
             .probe(&mut doc)
             .map_err(|error| format!("{}：{error}", input.path.display()))?;
+        total += hits;
+        per_file.push(hits);
     }
     Ok(ProbeReport {
         fingerprint: fingerprint.to_string(),
         total,
+        per_file,
     })
 }
 

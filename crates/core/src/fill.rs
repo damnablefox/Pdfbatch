@@ -289,8 +289,11 @@ fn page_at(all: &[Page], index: usize) -> Result<Page> {
 /// 在单页上完成"注册图形状态 → 生成内容流 → 按层级写入"。
 fn paint(doc: &mut Document, page: &Page, style: &FillStyle) -> Result<()> {
     let crop = page.crop(doc);
-    let full_page = style.rect.is_none();
-    let rect = style.rect.unwrap_or([crop[0], crop[1], crop[2] - crop[0], crop[3] - crop[1]]);
+    let crop_rect = [crop[0], crop[1], crop[2] - crop[0], crop[3] - crop[1]];
+    let rect = style.rect.unwrap_or(crop_rect);
+    // 用「整页」选项，或恰好填满页面的自定义矩形，都按整页记录：
+    // 这样以后用「整页」条件查找时，两种来源都能找到。
+    let full_page = style.rect.is_none() || rect_is_full_page(rect, crop_rect);
     if !(rect[2] > 0.0 && rect[3] > 0.0) {
         return Err(BatchError::Arg(format!(
             "填充矩形宽高必须为正，当前是 {}×{}",
@@ -516,28 +519,46 @@ fn describe(doc: &Document, page: &Page, list: &[Object]) -> Result<Vec<LayerEnt
     Ok(out)
 }
 
+/// 矩形是否贴合页面 CropBox（容差 0.5pt）。
+///
+/// 用它而不是精确相等，是因为矩形的坐标要经过「四舍五入写进内容流 → 再解析回来」，
+/// 页面的 CropBox 也可能带小数；差一点点就判成「不是整页」会让查找莫名落空。
+fn rect_is_full_page(rect: [f64; 4], crop: [f64; 4]) -> bool {
+    rect.iter().zip(crop.iter()).all(|(a, b)| (a - b).abs() <= 0.5)
+}
+
 /// 读一条填充层的属性：优先自家 `/PBInfo`；旧文件回退解析内容流。
 fn read_info(doc: &Document, object: &Object, crop: [f64; 4], fallback_layer: Layer) -> Option<FillInfo> {
-    if let Some(dict) = doc.resolve(object).as_dict() {
-        if let Some(parsed) = dict.get(INFO_KEY).and_then(|o| o.as_dict()).and_then(FillInfo::from_dict) {
-            return Some(parsed);
+    let stored = doc
+        .resolve(object)
+        .as_dict()
+        .and_then(|dict| dict.get(INFO_KEY).and_then(|o| o.as_dict()).and_then(FillInfo::from_dict));
+    let mut info = match stored {
+        Some(info) => info,
+        None => {
+            // 回退：解析自己生成的内容流（`q /GS gs R G B rg x y w h re f Q`）。
+            let resolved = doc.resolve(object);
+            let Object::Stream(stream) = resolved.as_ref() else {
+                return None;
+            };
+            let bytes = stream.decoded().ok()?;
+            let (rect, color, blend, opacity) = parse_fill_content(&bytes)?;
+            FillInfo {
+                rect,
+                full_page: false,
+                color,
+                opacity,
+                blend,
+                layer: fallback_layer,
+            }
         }
-    }
-    // 回退：解析自己生成的内容流（`q /GS gs R G B rg x y w h re f Q`）。
-    let resolved = doc.resolve(object);
-    let Object::Stream(stream) = resolved.as_ref() else {
-        return None;
     };
-    let bytes = stream.decoded().ok()?;
-    let (rect, color, blend, opacity) = parse_fill_content(&bytes)?;
-    Some(FillInfo {
-        rect,
-        full_page: rect == crop,
-        color,
-        opacity,
-        blend,
-        layer: fallback_layer,
-    })
+    // 统一口径：只要矩形贴合页面 CropBox，就算「整页」。
+    // 这样旧版本留下的层、或用户手填了与页面同尺寸矩形的层，都能被「整页」条件找到。
+    if !info.full_page && rect_is_full_page(info.rect, crop) {
+        info.full_page = true;
+    }
+    Some(info)
 }
 
 /// 从自家生成的内容流里取回矩形、颜色、混合模式与透明度（旧文件的兜底）。
@@ -799,5 +820,73 @@ mod tests {
         // 具体矩形由调用方拿到页面 CropBox 后再覆盖。
         assert_eq!(next.rect, info.rect);
         assert!(!change.is_empty());
+    }
+
+    #[test]
+    fn full_page_flag_survives_a_dict_round_trip() {
+        let info = FillInfo { full_page: true, ..sample_info() };
+        assert_eq!(FillInfo::from_dict(&info.to_dict()), Some(info));
+    }
+
+    #[test]
+    fn rect_tolerance_treats_a_slightly_off_rect_as_full_page() {
+        let crop = [0.0, 0.0, 200.0, 300.0];
+        assert!(rect_is_full_page(crop, crop));
+        // 四舍五入 / 浮点带来的小偏差仍算整页。
+        assert!(rect_is_full_page([0.2, -0.3, 200.1, 299.8], crop));
+        // 明显更小的矩形不算。
+        assert!(!rect_is_full_page([10.0, 10.0, 180.0, 280.0], crop));
+    }
+
+    /// 一个只有一页的最小文档（页面 200×300）。
+    fn one_page_document() -> Document {
+        let mut doc = Document::new_empty();
+        let pages_ref = doc.add(Dict::new());
+        let page = doc.add(Dict::new());
+        let root = doc.root().expect("new_empty 有根节点");
+        doc.update_dict(root, |d| {
+            d.set(b"Type".to_vec(), Object::name("Catalog"));
+            d.set(b"Pages".to_vec(), Object::Ref(pages_ref));
+        })
+        .expect("写根字典");
+        doc.update_dict(pages_ref, |d| {
+            d.set(b"Type".to_vec(), Object::name("Pages"));
+            d.set(b"Kids".to_vec(), Object::Array(vec![Object::Ref(page)]));
+            d.set(b"Count".to_vec(), Object::Int(1));
+        })
+        .expect("写 Pages 字典");
+        doc.update_dict(page, |d| {
+            d.set(b"Type".to_vec(), Object::name("Page"));
+            d.set(b"Parent".to_vec(), Object::Ref(pages_ref));
+            d.set(
+                b"MediaBox".to_vec(),
+                Object::Array(vec![Object::Int(0), Object::Int(0), Object::Int(200), Object::Int(300)]),
+            );
+        })
+        .expect("写 Page 字典");
+        doc
+    }
+
+    #[test]
+    fn a_rect_matching_the_crop_box_is_found_by_the_full_page_matcher() {
+        let mut doc = one_page_document();
+        let page = pages(&doc)[0].clone();
+        let crop = page.crop(&doc);
+        let crop_rect = [crop[0], crop[1], crop[2] - crop[0], crop[3] - crop[1]];
+        // 故意写一条「标记为非整页」但矩形与页面等大的层，
+        // 模拟「自定义矩形填满整页」或旧版本留下的数据。
+        let info = FillInfo {
+            rect: crop_rect,
+            full_page: false,
+            color: [1.0, 0.92, 0.55],
+            opacity: 0.2,
+            blend: Blend::Normal,
+            layer: Layer::Top,
+        };
+        let content = fill_content("PBFillNormal20", info.color, info.rect);
+        place(&mut doc, &page, content, &info).expect("写入填充层");
+
+        let matcher = Matcher { rect: Some(RectMatch::FullPage), ..Matcher::default() };
+        assert_eq!(count(&mut doc, &[0], &matcher).unwrap(), 1, "整页条件应当命中这条层");
     }
 }
