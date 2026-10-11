@@ -9,7 +9,7 @@ use std::sync::atomic::AtomicBool;
 
 use pdfbatch_core::action::{OutcomeStatus, read_password_file, run_jobs};
 use pdfbatch_core::batch;
-use pdfbatch_core::{Action, BatchError, FillStyle};
+use pdfbatch_core::{Action, BatchError, FillOp};
 
 use cli::{Common, Invocation};
 
@@ -50,15 +50,8 @@ fn main() -> ExitCode {
         Invocation::Fill(args) => run(
             args.common,
             Kind::Fill {
-                style: FillStyle {
-                    rect: args.rect,
-                    color: args.color,
-                    opacity: args.opacity,
-                    blend: args.blend,
-                    layer: args.layer,
-                },
+                op: args.op,
                 pages: args.pages,
-                replace: args.replace,
             },
         ),
     }
@@ -73,9 +66,8 @@ enum Kind {
         replace: bool,
     },
     Fill {
-        style: FillStyle,
+        op: FillOp,
         pages: String,
-        replace: bool,
     },
 }
 
@@ -96,7 +88,7 @@ fn run(common: Common, kind: Kind) -> ExitCode {
             };
             Action::Bookmarks { spec, zero_based, strict, replace }
         }
-        Kind::Fill { style, pages, replace } => Action::Fill { style, pages, replace },
+        Kind::Fill { op, pages } => Action::Fill { op, pages },
     };
     let jobs = match batch::plan(&inputs, &common.output) {
         Ok(jobs) => jobs,

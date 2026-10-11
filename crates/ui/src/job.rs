@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use pdfbatch_core::action::{OutcomeStatus, run_jobs};
 use pdfbatch_core::batch::{self, Input, Job, Naming, OutputMode};
 use pdfbatch_core::spec::{self, SpecSections};
-use pdfbatch_core::{Action, Blend, FillStyle, Layer};
+use pdfbatch_core::{Action, Blend, FillChange, FillOp, FillStyle, Layer, Matcher, RectMatch};
 
 use crate::files::FileStatus;
 
@@ -50,9 +50,83 @@ pub enum OutputChoice {
     InPlace,
 }
 
+/// 填充区域的三种操作：增、删、改。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FillAction {
+    Add,
+    Erase,
+    Modify,
+}
+
+impl FillAction {
+    pub const ALL: [FillAction; 3] = [FillAction::Add, FillAction::Erase, FillAction::Modify];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            FillAction::Add => "新增",
+            FillAction::Erase => "删除",
+            FillAction::Modify => "修改",
+        }
+    }
+}
+
+/// 查找时按哪种粒度比对填充区域。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MatchRect {
+    /// 不限区域。
+    Any,
+    /// 只匹配整页填充。
+    FullPage,
+    /// 只比宽高（不看左下起点）。
+    Size,
+    /// 完整匹配左下起点与宽高。
+    Rect,
+}
+
+impl MatchRect {
+    pub const ALL: [MatchRect; 4] =
+        [MatchRect::Any, MatchRect::FullPage, MatchRect::Size, MatchRect::Rect];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MatchRect::Any => "不限",
+            MatchRect::FullPage => "整页",
+            MatchRect::Size => "按宽高",
+            MatchRect::Rect => "按起点+宽高",
+        }
+    }
+}
+
+/// 要把命中的填充区域改成什么样。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChangeRect {
+    /// 保持原样。
+    Keep,
+    /// 改成整页。
+    FullPage,
+    /// 改成具体矩形。
+    Rect,
+}
+
+impl ChangeRect {
+    pub const ALL: [ChangeRect; 3] = [ChangeRect::Keep, ChangeRect::FullPage, ChangeRect::Rect];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ChangeRect::Keep => "保持",
+            ChangeRect::FullPage => "改成整页",
+            ChangeRect::Rect => "改成矩形",
+        }
+    }
+}
+
 /// 填充区域模式的参数草稿。
 #[derive(Clone, Debug)]
 pub struct FillDraft {
+    /// 增 / 删 / 改。
+    pub action: FillAction,
+
+    // —— 新增用：要盖上去的样式 ——
     pub whole_page: bool,
     /// 用户空间矩形 `[x, y, 宽, 高]`（点，原点在页面左下角）。
     pub rect: [f64; 4],
@@ -61,24 +135,150 @@ pub struct FillDraft {
     pub opacity: f64,
     pub blend: Blend,
     pub layer: Layer,
-    /// 页范围原文（`all` 或 `1-5,8,10-`）。
-    pub pages: String,
     /// 先摘掉本工具此前加的填充层再重画。
     pub replace: bool,
+
+    // —— 查找用：匹配条件 ——
+    pub match_rect: MatchRect,
+    /// `MatchRect::Size` 时用到的宽高。
+    pub match_size: [f64; 2],
+    /// `MatchRect::Rect` 时用到的左下起点与宽高。
+    pub match_rect_value: [f64; 4],
+    pub match_color_on: bool,
+    pub match_color: egui::Color32,
+    pub match_opacity_on: bool,
+    pub match_opacity: f64,
+    pub match_blend_on: bool,
+    pub match_blend: Blend,
+    pub match_layer_on: bool,
+    pub match_layer: Layer,
+    /// 数值比较容差（矩形、颜色、透明度都用它）。0 表示精确相等。
+    pub tolerance: f64,
+
+    // —— 修改用：更改要求（每项可单独开关） ——
+    pub change_rect: ChangeRect,
+    pub change_rect_value: [f64; 4],
+    pub change_color_on: bool,
+    pub change_color: egui::Color32,
+    pub change_opacity_on: bool,
+    pub change_opacity: f64,
+    pub change_blend_on: bool,
+    pub change_blend: Blend,
+    pub change_layer_on: bool,
+    pub change_layer: Layer,
+
+    /// 页范围原文（`all` 或 `1-5,8,10-`）。
+    pub pages: String,
 }
 
 impl Default for FillDraft {
     fn default() -> Self {
+        let default_rect = [72.0, 72.0, 400.0, 150.0];
+        let default_color = egui::Color32::from_rgb(255, 235, 140);
         Self {
+            action: FillAction::Add,
+
             whole_page: true,
-            rect: [72.0, 72.0, 400.0, 150.0],
-            color: egui::Color32::from_rgb(255, 235, 140),
+            rect: default_rect,
+            color: default_color,
             opacity: 0.2,
             blend: Blend::Normal,
             layer: Layer::Top,
-            pages: "all".to_string(),
             replace: false,
+
+            match_rect: MatchRect::Any,
+            match_size: [400.0, 150.0],
+            match_rect_value: default_rect,
+            match_color_on: false,
+            match_color: default_color,
+            match_opacity_on: false,
+            match_opacity: 0.2,
+            match_blend_on: false,
+            match_blend: Blend::Normal,
+            match_layer_on: false,
+            match_layer: Layer::Top,
+            tolerance: 0.0,
+
+            change_rect: ChangeRect::Keep,
+            change_rect_value: default_rect,
+            change_color_on: false,
+            change_color: default_color,
+            change_opacity_on: false,
+            change_opacity: 0.2,
+            change_blend_on: false,
+            change_blend: Blend::Normal,
+            change_layer_on: false,
+            change_layer: Layer::Top,
+
+            pages: "all".to_string(),
         }
+    }
+}
+
+/// 把 sRGB 取色控件的颜色转成 PDF 的 0.0–1.0 分量。
+fn srgb(color: egui::Color32) -> [f64; 3] {
+    [
+        f64::from(color.r()) / 255.0,
+        f64::from(color.g()) / 255.0,
+        f64::from(color.b()) / 255.0,
+    ]
+}
+
+/// 由草稿里的匹配条件得到查找谓词。
+fn fill_matcher(fill: &FillDraft) -> Matcher {
+    Matcher {
+        rect: match fill.match_rect {
+            MatchRect::Any => None,
+            MatchRect::FullPage => Some(RectMatch::FullPage),
+            MatchRect::Size => Some(RectMatch::Size(fill.match_size)),
+            MatchRect::Rect => Some(RectMatch::Rect(fill.match_rect_value)),
+        },
+        color: fill.match_color_on.then(|| srgb(fill.match_color)),
+        opacity: fill.match_opacity_on.then_some(fill.match_opacity),
+        blend: fill.match_blend_on.then_some(fill.match_blend),
+        layer: fill.match_layer_on.then_some(fill.match_layer),
+        tolerance: fill.tolerance,
+    }
+}
+
+/// 由草稿里的更改要求得到改写内容；全为 `None` 时返回空（表示没勾任何项）。
+fn fill_change(fill: &FillDraft) -> FillChange {
+    FillChange {
+        rect: (fill.change_rect == ChangeRect::Rect).then_some(fill.change_rect_value),
+        full_page: (fill.change_rect == ChangeRect::FullPage).then_some(true),
+        color: fill.change_color_on.then(|| srgb(fill.change_color)),
+        opacity: fill.change_opacity_on.then_some(fill.change_opacity),
+        blend: fill.change_blend_on.then_some(fill.change_blend),
+        layer: fill.change_layer_on.then_some(fill.change_layer),
+    }
+}
+
+/// 匹配条件的指纹：条件一变，之前的查找结果就作废，需重新查找。
+pub fn matcher_fingerprint(fill: &FillDraft) -> String {
+    format!(
+        "rect={:?} size={:?} rectv={:?} color={}:{:?} opacity={}:{} blend={}:{:?} layer={}:{:?} tol={} pages={}",
+        fill.match_rect,
+        fill.match_size,
+        fill.match_rect_value,
+        fill.match_color_on,
+        fill.match_color,
+        fill.match_opacity_on,
+        fill.match_opacity,
+        fill.match_blend_on,
+        fill.match_blend,
+        fill.match_layer_on,
+        fill.match_layer,
+        fill.tolerance,
+        fill.pages,
+    )
+}
+
+/// 页范围原文（空则按 `all`）。
+fn pages_text(fill: &FillDraft) -> String {
+    if fill.pages.trim().is_empty() {
+        "all".to_string()
+    } else {
+        fill.pages.clone()
     }
 }
 
@@ -160,12 +360,21 @@ pub fn preflight(
         validate_naming(&common.prefix, &common.suffix)?;
     }
     match mode {
-        Mode::Fill => {
-            if !fill.whole_page && !(fill.rect[2] > 0.0 && fill.rect[3] > 0.0) {
-                return Err("填充矩形的宽和高必须大于 0".to_string());
+        Mode::Fill => match fill.action {
+            FillAction::Add => {
+                if !fill.whole_page && !(fill.rect[2] > 0.0 && fill.rect[3] > 0.0) {
+                    return Err("填充矩形的宽和高必须大于 0".to_string());
+                }
+                validate_page_syntax(&fill.pages)?;
             }
-            validate_page_syntax(&fill.pages)?;
-        }
+            FillAction::Erase => validate_page_syntax(&fill.pages)?,
+            FillAction::Modify => {
+                if fill_change(fill).is_empty() {
+                    return Err("修改模式至少要勾选一项要改的属性".to_string());
+                }
+                validate_page_syntax(&fill.pages)?;
+            }
+        },
         Mode::Bookmarks => {
             if bookmarks.text.trim().is_empty() {
                 return Err("书签文本是空的".to_string());
@@ -245,25 +454,29 @@ pub fn build_request(
 
     let action = match mode {
         Mode::Fill => {
-            let rect = if fill.whole_page {
-                None
-            } else {
-                Some(fill.rect)
+            let op = match fill.action {
+                FillAction::Add => {
+                    let rect = if fill.whole_page { None } else { Some(fill.rect) };
+                    FillOp::Add {
+                        style: FillStyle {
+                            rect,
+                            color: srgb(fill.color),
+                            opacity: fill.opacity.clamp(0.0, 1.0),
+                            blend: fill.blend,
+                            layer: fill.layer,
+                        },
+                        replace: fill.replace,
+                    }
+                }
+                FillAction::Erase => FillOp::Remove(fill_matcher(fill)),
+                FillAction::Modify => FillOp::Modify {
+                    matcher: fill_matcher(fill),
+                    change: fill_change(fill),
+                },
             };
             Action::Fill {
-                style: FillStyle {
-                    rect,
-                    color: [
-                        f64::from(fill.color.r()) / 255.0,
-                        f64::from(fill.color.g()) / 255.0,
-                        f64::from(fill.color.b()) / 255.0,
-                    ],
-                    opacity: fill.opacity.clamp(0.0, 1.0),
-                    blend: fill.blend,
-                    layer: fill.layer,
-                },
-                pages: if fill.pages.trim().is_empty() { "all".to_string() } else { fill.pages.clone() },
-                replace: fill.replace,
+                op,
+                pages: pages_text(fill),
             }
         }
         Mode::Bookmarks => Action::Bookmarks {
@@ -289,40 +502,52 @@ pub fn build_request(
     })
 }
 
+/// 构造一次「只查找」的请求：删/改模式下，执行前先统计会命中多少填充层。
+///
+/// 与 `build_request` 不同，这里不要求配置更改要求——查找只关心匹配条件本身。
+pub fn build_probe_request(
+    mode: Mode,
+    fill: &FillDraft,
+    common: &CommonOptions,
+    inputs: Vec<Input>,
+) -> Result<Request, String> {
+    if inputs.is_empty() {
+        return Err("请先添加 PDF 文件或文件夹".to_string());
+    }
+    if mode != Mode::Fill {
+        return Err("只有填充区域需要查找".to_string());
+    }
+    validate_page_syntax(&fill.pages)?;
+    let action = Action::Fill {
+        // 用「删除」包裹匹配条件：probe 只看 matcher，不看操作种类。
+        op: FillOp::Remove(fill_matcher(fill)),
+        pages: pages_text(fill),
+    };
+    let password = {
+        let trimmed = common.password.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    };
+    Ok(Request {
+        action,
+        inputs,
+        // 查找不写文件，输出位置只作占位。
+        output: OutputMode::SameFolder {
+            naming: Naming {
+                prefix: String::new(),
+                suffix: String::new(),
+            },
+        },
+        password,
+        full_save: false,
+    })
+}
+
 /// 页范围的**语法**校验：只查写法对不对、起止是否颠倒，不查是否越界
 /// （越界要按每个文档的实际页数裁定，运行时逐文件处理）。
 pub(crate) fn validate_page_syntax(spec: &str) -> Result<(), String> {
-    let text = spec.trim();
-    if text.is_empty() || text.eq_ignore_ascii_case("all") {
-        return Ok(());
-    }
-    for part in text.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        let (start_text, end_text) = match part.split_once('-') {
-            Some((a, b)) => (a.trim(), b.trim()),
-            None => (part, ""),
-        };
-        if start_text.is_empty() || !start_text.chars().all(|c| c.is_ascii_digit()) {
-            return Err(format!("页范围 `{part}` 的起点不是数字"));
-        }
-        let start: u64 = start_text.parse().map_err(|_| format!("页范围 `{part}` 的起点不是数字"))?;
-        if start == 0 {
-            return Err(format!("页范围 `{part}`：页码从 1 开始"));
-        }
-        if !end_text.is_empty() {
-            if !end_text.chars().all(|c| c.is_ascii_digit()) {
-                return Err(format!("页范围 `{part}` 的终点不是数字"));
-            }
-            let end: u64 = end_text.parse().map_err(|_| format!("页范围 `{part}` 的终点不是数字"))?;
-            if start > end {
-                return Err(format!("页范围 `{part}`：起点大于终点"));
-            }
-        }
-    }
-    Ok(())
+    // 用一个足够大的假页数只做语法检查：first/last、负索引、`..`、except 都能解析；
+    // 越不越界留给运行时按各文件的实际页数裁定（例如 999999 在这里不算错）。
+    pdfbatch_core::pages::parse_pages(spec, 1_000_000).map(|_| ())
 }
 
 /// 后台任务的进度快照。
@@ -458,6 +683,67 @@ pub fn spawn_job(request: Request, ctx: egui::Context) -> Result<JobRun, String>
         cancel,
         progress,
         handle: Some(handle),
+    })
+}
+
+/// 一次查找的结果。
+#[derive(Clone, Debug)]
+pub struct ProbeReport {
+    /// 生成它时的匹配条件指纹；条件变了这份结果就作废。
+    pub fingerprint: String,
+    /// 命中的填充层总数。
+    pub total: usize,
+}
+
+/// 一次正在运行（或刚结束）的查找任务。
+pub struct ProbeRun {
+    result: Arc<Mutex<Option<Result<ProbeReport, String>>>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ProbeRun {
+    /// 取出结果；还没跑完时返回 `None`。
+    pub fn take(&mut self) -> Option<Result<ProbeReport, String>> {
+        self.result.lock().unwrap_or_else(PoisonError::into_inner).take()
+    }
+}
+
+impl Drop for ProbeRun {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// 在后台线程里统计匹配数量（只读文件，不改盘）。
+pub fn spawn_probe(request: Request, fingerprint: String, ctx: egui::Context) -> Result<ProbeRun, String> {
+    let result = Arc::new(Mutex::new(None));
+    let result_worker = result.clone();
+    let handle = std::thread::Builder::new()
+        .name("pdfbatch-probe".into())
+        .spawn(move || {
+            let outcome = probe_all(&request, &fingerprint);
+            *result_worker.lock().unwrap_or_else(PoisonError::into_inner) = Some(outcome);
+            ctx.request_repaint();
+        })
+        .map_err(|error| format!("无法启动查找任务：{error}"))?;
+    Ok(ProbeRun { result, handle: Some(handle) })
+}
+
+fn probe_all(request: &Request, fingerprint: &str) -> Result<ProbeReport, String> {
+    let mut total = 0usize;
+    for input in &request.inputs {
+        let mut doc = pdfbatch_core::pdf::open(&input.path, request.password.as_deref())
+            .map_err(|error| format!("{}：{error}", input.path.display()))?;
+        total += request
+            .action
+            .probe(&mut doc)
+            .map_err(|error| format!("{}：{error}", input.path.display()))?;
+    }
+    Ok(ProbeReport {
+        fingerprint: fingerprint.to_string(),
+        total,
     })
 }
 
@@ -704,7 +990,7 @@ mod tests {
         )
         .unwrap();
         match request.action {
-            Action::Fill { style, .. } => {
+            Action::Fill { op: FillOp::Add { style, .. }, .. } => {
                 assert!((style.color[0] - 227.0 / 255.0).abs() < 1e-9, "{:?}", style.color);
                 assert!((style.color[1] - 237.0 / 255.0).abs() < 1e-9, "{:?}", style.color);
                 assert!((style.color[2] - 203.0 / 255.0).abs() < 1e-9, "{:?}", style.color);
@@ -799,5 +1085,73 @@ mod tests {
             other => panic!("应当完成，实际 {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn erase_request_carries_the_match_conditions() {
+        let fill = FillDraft {
+            action: FillAction::Erase,
+            match_rect: MatchRect::FullPage,
+            match_color_on: true,
+            match_color: egui::Color32::from_rgb(255, 224, 140),
+            pages: "all except first,last".to_string(),
+            ..FillDraft::default()
+        };
+        let request = build_request(
+            Mode::Fill,
+            &fill,
+            &BookmarkDraft::default(),
+            &CommonOptions::default(),
+            vec![input("D:/a.pdf")],
+        )
+        .unwrap();
+        match request.action {
+            Action::Fill { op: FillOp::Remove(m), pages } => {
+                assert_eq!(m.rect, Some(RectMatch::FullPage));
+                assert!(m.color.is_some());
+                assert_eq!(pages, "all except first,last");
+            }
+            other => panic!("应当是删除：{other:?}"),
+        }
+    }
+
+    #[test]
+    fn modify_requires_at_least_one_change() {
+        let empty = FillDraft {
+            action: FillAction::Modify,
+            ..FillDraft::default()
+        };
+        let error = build_request(
+            Mode::Fill,
+            &empty,
+            &BookmarkDraft::default(),
+            &CommonOptions::default(),
+            vec![input("D:/a.pdf")],
+        )
+        .unwrap_err();
+        assert!(error.contains("勾选"), "{error}");
+
+        let filled = FillDraft {
+            action: FillAction::Modify,
+            change_color_on: true,
+            change_color: egui::Color32::from_rgb(0, 255, 0),
+            ..FillDraft::default()
+        };
+        let request = build_request(
+            Mode::Fill,
+            &filled,
+            &BookmarkDraft::default(),
+            &CommonOptions::default(),
+            vec![input("D:/a.pdf")],
+        )
+        .unwrap();
+        match request.action {
+            Action::Fill { op: FillOp::Modify { change, .. }, .. } => {
+                assert_eq!(change.color, Some([0.0, 1.0, 0.0]));
+                assert_eq!(change.opacity, None, "没勾的维度不该动");
+                assert_eq!(change.full_page, None);
+            }
+            other => panic!("应当是修改：{other:?}"),
+        }
     }
 }

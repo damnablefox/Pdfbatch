@@ -15,8 +15,8 @@ pub mod pages;
 pub mod pdf;
 pub mod spec;
 
-pub use action::{Action, BookmarkSpec, Outcome, OutcomeStatus, bookmark_spec, run_jobs};
+pub use action::{Action, BookmarkSpec, FillOp, Outcome, OutcomeStatus, bookmark_spec, run_jobs};
 pub use batch::{Input, Job, Naming, OutputMode};
 pub use blend::Blend;
 pub use error::{BatchError, Result};
-pub use fill::{FillStyle, Layer};
+pub use fill::{FillChange, FillInfo, FillStyle, Layer, Matcher, RectMatch};

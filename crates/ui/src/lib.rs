@@ -21,7 +21,10 @@ use pdfbatch_core::spec::SpecEntry;
 use pdfbatch_core::{Blend, Layer};
 
 use files::{FileList, FileStatus};
-use job::{BookmarkDraft, CommonOptions, FillDraft, JobProgress, Mode, OutputChoice};
+use job::{
+    BookmarkDraft, ChangeRect, CommonOptions, FillAction, FillDraft, JobProgress, MatchRect, Mode,
+    OutputChoice,
+};
 use pickers::{PickPurpose, Pickers};
 use theme::{ThemeKind, Tokens};
 
@@ -102,6 +105,10 @@ pub struct App {
     run: Option<job::JobRun>,
     /// 正在运行任务的进度快照（用于底部执行条）。
     progress: Option<JobProgress>,
+    /// 正在运行的「查找匹配」任务。
+    probe: Option<job::ProbeRun>,
+    /// 最近一次查找的结果（删/改模式据此判断能否执行）。
+    probe_report: Option<job::ProbeReport>,
     /// 浮动提示：消息 + 出现时刻。
     toast: Option<(String, f64)>,
     /// 是否有文件正被拖到窗口上（显示放置提示）。
@@ -124,6 +131,8 @@ impl Default for App {
             pickers: Pickers::default(),
             run: None,
             progress: None,
+            probe: None,
+            probe_report: None,
             toast: None,
             hover_drop: false,
             col_name_width: 260.0,
@@ -146,6 +155,7 @@ impl eframe::App for App {
         self.handle_dropped(ctx);
         self.handle_shortcuts(ctx);
         self.poll_job(ctx);
+        self.poll_probe(ctx);
         self.expire_toast(ctx);
     }
 
@@ -293,6 +303,47 @@ impl App {
         }
     }
 
+    /// 回填后台查找的结果。
+    fn poll_probe(&mut self, ctx: &egui::Context) {
+        let Some(mut run) = self.probe.take() else { return };
+        if let Some(result) = run.take() {
+            drop(run);
+            match result {
+                Ok(report) => {
+                    let total = report.total;
+                    self.probe_report = Some(report);
+                    self.notify(format!("查找完成：命中 {total} 个填充层"), ctx);
+                }
+                Err(message) => {
+                    self.probe_report = None;
+                    self.notify(message, ctx);
+                }
+            }
+        } else {
+            self.probe = Some(run);
+            ctx.request_repaint_after(Duration::from_millis(120));
+        }
+    }
+
+    /// 启动一次「查找匹配」（删/改模式执行前的统计）。
+    fn start_probe(&mut self, ctx: &egui::Context) {
+        if self.probe.is_some() || self.run.is_some() {
+            return;
+        }
+        let inputs = self.files.to_inputs();
+        match job::build_probe_request(self.mode, &self.fill, &self.common, inputs) {
+            Ok(request) => {
+                let fingerprint = job::matcher_fingerprint(&self.fill);
+                self.probe_report = None;
+                match job::spawn_probe(request, fingerprint, ctx.clone()) {
+                    Ok(run) => self.probe = Some(run),
+                    Err(message) => self.notify(message, ctx),
+                }
+            }
+            Err(message) => self.notify(message, ctx),
+        }
+    }
+
     /// 把进度里的逐行状态写回文件列表。
     fn apply_progress(&mut self, snapshot: &JobProgress) {
         for (index, status) in snapshot.statuses.iter().enumerate() {
@@ -427,6 +478,52 @@ impl App {
     }
 
     fn fill_params(&mut self, ui: &mut egui::Ui, t: Tokens) {
+        widgets::section_title(ui, "操作");
+        ui.horizontal(|ui| {
+            for action in FillAction::ALL {
+                ui.selectable_value(&mut self.fill.action, action, action.label());
+            }
+        });
+        ui.add_space(6.0);
+
+        match self.fill.action {
+            FillAction::Add => {
+                self.fill_add_style(ui, t);
+                self.fill_pages(ui, t);
+                ui.add_space(4.0);
+                ui.checkbox(&mut self.fill.replace, "先摘掉已有的填充层（替换）");
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new("这些参数会应用到左侧列表里的所有文件。")
+                        .font(regular(11.5))
+                        .color(t.text_faint),
+                );
+            }
+            FillAction::Erase => {
+                self.fill_match_options(ui, t);
+                self.fill_pages(ui, t);
+                self.fill_probe_row(ui, t);
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new("查找后按「执行」删除命中的填充层。")
+                        .font(regular(11.5))
+                        .color(t.text_faint),
+                );
+            }
+            FillAction::Modify => {
+                // 上部分：查找选项；下部分：更改要求。
+                self.fill_match_options(ui, t);
+                self.fill_pages(ui, t);
+                self.fill_probe_row(ui, t);
+                ui.add_space(10.0);
+                widgets::section_title(ui, "更改要求");
+                self.fill_change_options(ui, t);
+            }
+        }
+    }
+
+    /// 新增模式：要盖上去的填充层样式。
+    fn fill_add_style(&mut self, ui: &mut egui::Ui, t: Tokens) {
         widgets::section_title(ui, "区域");
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.fill.whole_page, true, "整页");
@@ -436,20 +533,7 @@ impl App {
 
         if !self.fill.whole_page {
             let rect_ok = self.fill.rect[2] > 0.0 && self.fill.rect[3] > 0.0;
-            egui::Grid::new("fill-rect").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-                ui.label("X（左）");
-                ui.add(egui::DragValue::new(&mut self.fill.rect[0]).speed(1.0).range(0.0..=20000.0));
-                ui.end_row();
-                ui.label("Y（下）");
-                ui.add(egui::DragValue::new(&mut self.fill.rect[1]).speed(1.0).range(0.0..=20000.0));
-                ui.end_row();
-                ui.label("宽");
-                ui.add(egui::DragValue::new(&mut self.fill.rect[2]).speed(1.0).range(-20000.0..=20000.0));
-                ui.end_row();
-                ui.label("高");
-                ui.add(egui::DragValue::new(&mut self.fill.rect[3]).speed(1.0).range(-20000.0..=20000.0));
-                ui.end_row();
-            });
+            rect_rows(ui, "fill-rect", &mut self.fill.rect);
             if !rect_ok {
                 ui.label(egui::RichText::new("宽和高必须大于 0").font(regular(11.5)).color(danger()));
             }
@@ -472,39 +556,160 @@ impl App {
         widgets::section_title(ui, "混合与层级");
         ui.horizontal(|ui| {
             ui.label("混合模式");
-            egui::ComboBox::from_id_salt("pdfbatch-blend")
-                .width(150.0)
-                .selected_text(self.fill.blend.canonical())
-                .show_ui(ui, |ui| {
-                    for name in pdfbatch_core::blend::BLEND_NAMES {
-                        if let Ok(blend) = Blend::parse(name) {
-                            ui.selectable_value(&mut self.fill.blend, blend, name);
-                        }
-                    }
-                });
+            blend_combo(ui, "fill-blend", &mut self.fill.blend);
         });
         ui.horizontal(|ui| {
             ui.label("层级");
             ui.selectable_value(&mut self.fill.layer, Layer::Top, "置于顶层");
             ui.selectable_value(&mut self.fill.layer, Layer::Bottom, "置于底层");
         });
+    }
 
+    /// 作用范围（三种操作共用）。
+    fn fill_pages(&mut self, ui: &mut egui::Ui, _t: Tokens) {
         widgets::section_title(ui, "作用范围");
         ui.horizontal(|ui| {
             ui.label("页范围");
-            ui.add(egui::TextEdit::singleline(&mut self.fill.pages).hint_text("all 或 1-5,8,10-").desired_width(150.0));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.fill.pages)
+                    .hint_text("all、1-5,8,10-、all except first,last")
+                    .desired_width(180.0),
+            );
         });
         if let Err(message) = job::validate_page_syntax(&self.fill.pages) {
             ui.label(egui::RichText::new(message).font(regular(11.5)).color(danger()));
         }
-        ui.add_space(4.0);
-        ui.checkbox(&mut self.fill.replace, "先摘掉已有的填充层（替换）");
-        ui.add_space(8.0);
+    }
+
+    /// 查找条件（删/改模式共用）：填充区域、颜色、透明度、混合模式、层级。
+    fn fill_match_options(&mut self, ui: &mut egui::Ui, t: Tokens) {
+        widgets::section_title(ui, "查找条件");
         ui.label(
-            egui::RichText::new("这些参数会应用到左侧列表里的所有文件。")
-                .font(regular(11.5))
+            egui::RichText::new("不勾任何项表示匹配本工具加的全部填充层。")
+                .font(regular(11.0))
                 .color(t.text_faint),
         );
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label("填充区域");
+            for choice in MatchRect::ALL {
+                ui.selectable_value(&mut self.fill.match_rect, choice, choice.label());
+            }
+        });
+        match self.fill.match_rect {
+            MatchRect::Size => size_row(ui, &mut self.fill.match_size),
+            MatchRect::Rect => rect_rows(ui, "fill-match-rect", &mut self.fill.match_rect_value),
+            MatchRect::Any | MatchRect::FullPage => {}
+        }
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.fill.match_color_on, "填充颜色");
+            if self.fill.match_color_on {
+                egui::color_picker::color_edit_button_srgba(
+                    ui,
+                    &mut self.fill.match_color,
+                    egui::color_picker::Alpha::Opaque,
+                );
+                ui.label(egui::RichText::new(hex(self.fill.match_color)).font(regular(12.0)).color(t.text_muted));
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.fill.match_opacity_on, "透明度");
+            if self.fill.match_opacity_on {
+                ui.add(egui::Slider::new(&mut self.fill.match_opacity, 0.0..=1.0).fixed_decimals(2));
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.fill.match_blend_on, "混合模式");
+            if self.fill.match_blend_on {
+                blend_combo(ui, "fill-match-blend", &mut self.fill.match_blend);
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.fill.match_layer_on, "层级");
+            if self.fill.match_layer_on {
+                ui.selectable_value(&mut self.fill.match_layer, Layer::Top, "顶层");
+                ui.selectable_value(&mut self.fill.match_layer, Layer::Bottom, "底层");
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("数值容差");
+            ui.add(egui::DragValue::new(&mut self.fill.tolerance).speed(0.001).range(0.0..=1.0));
+            ui.label(egui::RichText::new("0 表示精确相等").font(regular(11.0)).color(t.text_faint));
+        });
+    }
+
+    /// 查找按钮与命中数量提示。
+    fn fill_probe_row(&mut self, ui: &mut egui::Ui, t: Tokens) {
+        ui.add_space(6.0);
+        let busy = self.probe.is_some();
+        let mut clicked = false;
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(!busy, |ui| {
+                if widgets::pill_button(ui, "查找匹配", false).clicked() {
+                    clicked = true;
+                }
+            });
+            if busy {
+                ui.label(egui::RichText::new("查找中…").font(regular(12.0)).color(t.text_muted));
+            }
+        });
+        if let Some(report) = &self.probe_report {
+            let fresh = report.fingerprint == job::matcher_fingerprint(&self.fill);
+            let (text, color) = if !fresh {
+                ("匹配条件已变，请重新查找".to_string(), t.text_faint)
+            } else if report.total == 0 {
+                ("没有匹配到填充层".to_string(), warn())
+            } else {
+                (format!("命中 {} 个填充层", report.total), ok())
+            };
+            ui.label(egui::RichText::new(text).font(regular(12.0)).color(color));
+        }
+        if clicked {
+            self.start_probe(ui.ctx());
+        }
+    }
+
+    /// 更改要求（改模式）：命中的填充层要改成什么样。
+    fn fill_change_options(&mut self, ui: &mut egui::Ui, t: Tokens) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("填充区域");
+            for choice in ChangeRect::ALL {
+                ui.selectable_value(&mut self.fill.change_rect, choice, choice.label());
+            }
+        });
+        if self.fill.change_rect == ChangeRect::Rect {
+            rect_rows(ui, "fill-change-rect", &mut self.fill.change_rect_value);
+        }
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.fill.change_color_on, "改成颜色");
+            if self.fill.change_color_on {
+                egui::color_picker::color_edit_button_srgba(
+                    ui,
+                    &mut self.fill.change_color,
+                    egui::color_picker::Alpha::Opaque,
+                );
+                ui.label(egui::RichText::new(hex(self.fill.change_color)).font(regular(12.0)).color(t.text_muted));
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.fill.change_opacity_on, "改成不透明度");
+            if self.fill.change_opacity_on {
+                ui.add(egui::Slider::new(&mut self.fill.change_opacity, 0.0..=1.0).fixed_decimals(2));
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.fill.change_blend_on, "改成混合模式");
+            if self.fill.change_blend_on {
+                blend_combo(ui, "fill-change-blend", &mut self.fill.change_blend);
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.fill.change_layer_on, "改成层级");
+            if self.fill.change_layer_on {
+                ui.selectable_value(&mut self.fill.change_layer, Layer::Top, "顶层");
+                ui.selectable_value(&mut self.fill.change_layer, Layer::Bottom, "底层");
+            }
+        });
     }
 
     fn bookmark_params(&mut self, ui: &mut egui::Ui, t: Tokens) {
@@ -897,6 +1102,13 @@ impl App {
         let mut clicked_run = false;
         let mut clicked_cancel = false;
 
+        // 删/改必须先查找匹配，且命中数非零才允许执行。
+        let needs_probe = self.mode == Mode::Fill && self.fill.action != FillAction::Add;
+        let probe_ok = self.probe_report.as_ref().is_some_and(|report| {
+            report.total > 0 && report.fingerprint == job::matcher_fingerprint(&self.fill)
+        });
+        let ready = preflight.is_ok() && (!needs_probe || probe_ok);
+
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             if busy {
@@ -923,9 +1135,8 @@ impl App {
                     }
                 });
             } else {
-                let enabled = preflight.is_ok();
                 let response = ui
-                    .add_enabled_ui(enabled, |ui| widgets::pill_button(ui, "▶ 执行", true))
+                    .add_enabled_ui(ready, |ui| widgets::pill_button(ui, "▶ 执行", true))
                     .inner;
                 if response.clicked() {
                     clicked_run = true;
@@ -933,11 +1144,31 @@ impl App {
                 ui.add_space(10.0);
                 match &preflight {
                     Ok(()) => {
-                        ui.label(
-                            egui::RichText::new(format!("将对 {file_count} 个文件执行「{}」", self.mode.label()))
-                                .font(regular(12.0))
-                                .color(t.text_muted),
-                        );
+                        let (text, color) = if self.mode == Mode::Bookmarks {
+                            (format!("将对 {file_count} 个文件执行「书签」"), t.text_muted)
+                        } else {
+                            match self.fill.action {
+                                FillAction::Add => {
+                                    (format!("将对 {file_count} 个文件执行「新增填充层」"), t.text_muted)
+                                }
+                                FillAction::Erase | FillAction::Modify => {
+                                    if probe_ok {
+                                        let total =
+                                            self.probe_report.as_ref().map(|report| report.total).unwrap_or(0);
+                                        (
+                                            format!(
+                                                "将对 {file_count} 个文件执行「{}」，命中 {total} 个填充层",
+                                                self.fill.action.label()
+                                            ),
+                                            t.text_muted,
+                                        )
+                                    } else {
+                                        ("请先在左侧点「查找匹配」，命中非零才可执行".to_string(), warn())
+                                    }
+                                }
+                            }
+                        };
+                        ui.label(egui::RichText::new(text).font(regular(12.0)).color(color));
                     }
                     Err(message) => {
                         ui.label(egui::RichText::new(message).font(regular(12.0)).color(danger()));
@@ -1028,7 +1259,7 @@ fn status_color(status: &FileStatus, t: &Tokens) -> egui::Color32 {
         FileStatus::Failed(_) => danger(),
         FileStatus::Skipped(_) => t.text_faint,
         FileStatus::Running => t.accent_text,
-        FileStatus::Done(_) => egui::Color32::from_rgb(0x1E, 0x8E, 0x3E),
+        FileStatus::Done(_) => ok(),
         FileStatus::Pending => t.text_muted,
     }
 }
@@ -1039,6 +1270,54 @@ fn danger() -> egui::Color32 {
 
 fn warn() -> egui::Color32 {
     egui::Color32::from_rgb(0xB4, 0x6A, 0x00)
+}
+
+fn ok() -> egui::Color32 {
+    egui::Color32::from_rgb(0x1E, 0x8E, 0x3E)
+}
+
+/// 混合模式下拉框（新增、查找、更改共用）。
+fn blend_combo(ui: &mut egui::Ui, id: &str, value: &mut Blend) {
+    egui::ComboBox::from_id_salt(id)
+        .width(150.0)
+        .selected_text(value.canonical())
+        .show_ui(ui, |ui| {
+            for name in pdfbatch_core::blend::BLEND_NAMES {
+                if let Ok(blend) = Blend::parse(name) {
+                    ui.selectable_value(value, blend, name);
+                }
+            }
+        });
+}
+
+/// 「宽 × 高」两格输入（按宽高匹配时用）。
+fn size_row(ui: &mut egui::Ui, size: &mut [f64; 2]) {
+    egui::Grid::new("fill-size").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+        ui.label("宽");
+        ui.add(egui::DragValue::new(&mut size[0]).speed(1.0).range(0.0..=20000.0));
+        ui.end_row();
+        ui.label("高");
+        ui.add(egui::DragValue::new(&mut size[1]).speed(1.0).range(0.0..=20000.0));
+        ui.end_row();
+    });
+}
+
+/// 「左下起点 + 宽高」四格输入（按完整矩形匹配/修改时用）。
+fn rect_rows(ui: &mut egui::Ui, id: &str, rect: &mut [f64; 4]) {
+    egui::Grid::new(id).num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+        ui.label("X（左）");
+        ui.add(egui::DragValue::new(&mut rect[0]).speed(1.0).range(0.0..=20000.0));
+        ui.end_row();
+        ui.label("Y（下）");
+        ui.add(egui::DragValue::new(&mut rect[1]).speed(1.0).range(0.0..=20000.0));
+        ui.end_row();
+        ui.label("宽");
+        ui.add(egui::DragValue::new(&mut rect[2]).speed(1.0).range(-20000.0..=20000.0));
+        ui.end_row();
+        ui.label("高");
+        ui.add(egui::DragValue::new(&mut rect[3]).speed(1.0).range(-20000.0..=20000.0));
+        ui.end_row();
+    });
 }
 
 /// 预览一段书签树（空段与警告一并显示）。
