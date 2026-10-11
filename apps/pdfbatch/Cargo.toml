@@ -1,0 +1,19 @@
+[package]
+name = "pdfbatch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "图形界面：批量给 PDF 加书签、批量盖纯色填充层"
+
+[[bin]]
+name = "pdfbatch"
+path = "src/main.rs"
+
+[dependencies]
+pdfbatch-ui = { path = "../../crates/ui" }
+eframe.workspace = true
+
+[build-dependencies]
+# 只在 Windows 上用来把图标与版本信息嵌进 pdfbatch.exe。
+winresource = "0.1"

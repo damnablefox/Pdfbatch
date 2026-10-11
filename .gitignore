@@ -1,0 +1,17 @@
+# Rust 构建产物
+/target
+
+# 本地分发/便携包与构建日志（不进仓库）
+/dist
+*.log
+
+# 编辑器与系统文件
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 备份与临时文件
+*.rs.bk
+*.tmp
+*~

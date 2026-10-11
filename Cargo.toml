@@ -1,0 +1,37 @@
+# pdfbatch —— 给 PDF 批量加书签、批量盖纯色填充层。
+#
+# 组织方式与 PdfCraft 相同：workspace 根 + crates/ 库 + apps/ 多个独立二进制。
+#   crates/core       核心逻辑（书签文本解析、填充层、批量管线）
+#   crates/ui         图形界面层
+#   apps/pdfbatch     图形界面二进制
+#   apps/pdfbatch-cli 命令行二进制
+[workspace]
+resolver = "3"
+members = ["crates/*", "apps/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+description = "Batch bookmarks and coloured fill layers for PDFs, built on PdfCraft's engine crates."
+
+[workspace.dependencies]
+# PdfCraft 的库 crate（相对 workspace 根解析）。
+pdfcraft-cos = { path = "../pdfcraft/crates/cos" }
+pdfcraft-content = { path = "../pdfcraft/crates/content" }
+pdfcraft-organize = { path = "../pdfcraft/crates/organize" }
+pdfcraft-model = { path = "../pdfcraft/crates/model" }
+pdfcraft-geom = { path = "../pdfcraft/crates/geom" }
+pdfcraft-fonts = { path = "../pdfcraft/crates/fonts" }
+
+thiserror = "2"
+
+# 界面：只用 glow 渲染后端，不引入 wgpu/naga。
+egui = "0.36"
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "wayland", "x11", "accesskit"] }
+egui_extras = { version = "0.36", default-features = false }
+rfd = "0.17"
+pollster = "1.0"
+# 只在启动时解一次窗口图标 PNG（已在依赖树里，随 arboard/image 进来）。
+png = "0.18"

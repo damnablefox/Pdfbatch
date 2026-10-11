@@ -1,0 +1,17 @@
+[package]
+name = "pdfbatch-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "图形界面层：与 PdfCraft 同风格的 egui 界面"
+
+[dependencies]
+pdfbatch-core = { path = "../core" }
+egui.workspace = true
+eframe.workspace = true
+egui_extras.workspace = true
+pdfcraft-fonts.workspace = true
+rfd.workspace = true
+pollster.workspace = true
+png.workspace = true

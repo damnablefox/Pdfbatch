@@ -1,0 +1,13 @@
+[package]
+name = "pdfbatch-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "核心逻辑：书签文本批量导入、填充层的批量应用与批量文件管线"
+
+[dependencies]
+pdfcraft-cos.workspace = true
+pdfcraft-organize.workspace = true
+pdfcraft-model.workspace = true
+thiserror.workspace = true
