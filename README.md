@@ -73,22 +73,34 @@ PDF 引擎直接复用 PdfCraft 的库 crate（对象层、书签、页面模型
 
 需要 Rust ≥ 1.90（`edition 2024`）。
 
-```sh
-git clone https://github.com/damnablefox/Pdfbatch.git pdfbatch
-cd pdfbatch
+本项目复用 [PdfCraft](https://github.com/storytold/pdfcraft) 的引擎 crate（尚未发布到 crates.io），并且是**相对路径引用**（`../pdfcraft/crates/*`）。因此要把两个仓库克隆到**同一个父目录**、让 `pdfcraft` 与 `pdfbatch` 平级：
 
+```sh
+# 1) 先取引擎源码（必需，必须在 pdfbatch 之前就位）
+git clone https://github.com/storytold/pdfcraft.git pdfcraft   # 若你用的是自己的 fork，换成对应地址
+
+# 2) 再取本项目
+git clone https://github.com/damnablefox/Pdfbatch.git pdfbatch
+
+# 3) 构建（在 pdfbatch 目录里）
+cd pdfbatch
 cargo build --release          # 产物：target/release/pdfbatch.exe 与 pdfbatch-cli.exe
 cargo test                     # 单元测试（核心 + 界面 + 命令行）
 ```
 
+克隆后的目录结构：
+
+```
+your-workspace/
+├── pdfcraft/     ← 引擎源码（必需）
+└── pdfbatch/     ← 本项目
+```
+
+> **注意**：只克隆 `pdfbatch` 一个仓库是**无法构建的**——Cargo 会去找同级的 `../pdfcraft` 目录，找不到就直接失败。请按上面的顺序把两个仓库放在一起。
+
 ### 依赖
 
-- **PdfCraft 引擎**：通过相对路径依赖 `../pdfcraft`，所以克隆本仓库时请把 PdfCraft 源码放在**同级目录**：
-  ```
-  your-workspace/
-  ├── pdfcraft/     ← 引擎源码（必需）
-  └── pdfbatch/     ← 本项目
-  ```
+- **PdfCraft 引擎（必需）**：见上，[Cargo.toml](Cargo.toml) 以路径依赖 `../pdfcraft/crates/*` 引用它的对象层、书签与页面模型等 crate。
 - **中文字体（已内置）**：界面中文使用**霞鹜文楷**，字体文件随仓库提供（`assets/fonts/LXGWWenKai-Regular.ttf`，SIL OFL 1.1），因此**无需任何额外构建输入**，构建产物一定能正常显示中文。
   如需换成自己的字体，替换 `assets/fonts/` 下的字体文件并调整 [`crates/ui/src/theme.rs`](crates/ui/src/theme.rs) 的字体栈即可（原来的 [craft-fonts](https://github.com/storytold/craft-fonts) 就是一份类似的、可替换的字库）。
 
