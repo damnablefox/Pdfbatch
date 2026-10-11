@@ -11,7 +11,6 @@ pdfbatch-core = { path = "../core" }
 egui.workspace = true
 eframe.workspace = true
 egui_extras.workspace = true
-pdfcraft-fonts.workspace = true
 rfd.workspace = true
 pollster.workspace = true
 png.workspace = true

@@ -195,8 +195,9 @@ pub fn semibold(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name("semibold".into()))
 }
 
-/// 界面字体：比例字体最前面放 craft-fonts 的中文面（界面文案统一由它绘制），
-/// 其后是 Inter；等宽字体仍是 JetBrains Mono 在前、中文面兜底。
+/// 界面字体：中文字面（霞鹜文楷）内置在 `assets/fonts`，任何构建都能正常显示中文，
+/// 不再依赖可选的 craft-fonts。比例字体最前面是霞鹜文楷、其后 Inter；
+/// 等宽字体仍是 JetBrains Mono 在前、霞鹜文楷兜底中文。
 pub fn font_definitions() -> FontDefinitions {
     let mut fonts = FontDefinitions::default();
     let add = |fonts: &mut FontDefinitions, name: &str, bytes: &'static [u8]| {
@@ -212,33 +213,21 @@ pub fn font_definitions() -> FontDefinitions {
         "JetBrainsMono",
         include_bytes!("../../../assets/fonts/JetBrainsMono-Regular.ttf"),
     );
-    fonts
-        .families
-        .entry(FontFamily::Proportional)
-        .or_default()
-        .insert(0, "Inter".to_owned());
-    fonts
-        .families
-        .entry(FontFamily::Monospace)
-        .or_default()
-        .insert(0, "JetBrainsMono".to_owned());
+    // 内置霞鹜文楷（SIL OFL 1.1）：界面中文的统一字面。
+    add(
+        &mut fonts,
+        "LXGWWenKai",
+        include_bytes!("../../../assets/fonts/LXGWWenKai-Regular.ttf"),
+    );
 
-    let mut cjk: Vec<String> = Vec::new();
-    for face in pdfcraft_fonts::ui_cjk_fonts(true) {
-        let name = face.name();
-        if !fonts.font_data.contains_key(&name) {
-            add(&mut fonts, &name, face.bytes);
-        }
-        fonts.families.entry(FontFamily::Monospace).or_default().push(name.clone());
-        cjk.push(name);
-    }
-    // `ui_cjk_fonts` 已按语言排好先后，倒序插入可保持原顺序。
+    // 比例字体：霞鹜文楷最前、Inter 次之，其后是 egui 自带兜底。
     let proportional = fonts.families.entry(FontFamily::Proportional).or_default();
-    for name in cjk.into_iter().rev() {
-        if !proportional.contains(&name) {
-            proportional.insert(0, name);
-        }
-    }
+    proportional.insert(0, "LXGWWenKai".to_owned());
+    proportional.insert(1, "Inter".to_owned());
+    // 等宽字体：JetBrains Mono 在前，中文用霞鹜文楷兜底。
+    let monospace = fonts.families.entry(FontFamily::Monospace).or_default();
+    monospace.insert(0, "JetBrainsMono".to_owned());
+    monospace.push("LXGWWenKai".to_owned());
 
     // 带字重的两个族：半粗体在前，其余回退到比例字体栈。
     let fallback: Vec<String> = fonts.families[&FontFamily::Proportional].clone();
@@ -274,16 +263,12 @@ mod tests {
         assert_eq!(ThemeKind::Dark.toggled(), ThemeKind::Light);
     }
 
-    /// 比例字体的第一位应当是 craft-fonts 的中文面，中文才有真字形。
+    /// 中文面（霞鹜文楷）内置在字体栈最前，中文才有真字形。
     #[test]
     fn chinese_interface_text_has_real_glyphs() {
-        if pdfcraft_fonts::ui_cjk_fonts(true).is_empty() {
-            eprintln!("跳过 chinese_interface_text_has_real_glyphs：构建时没有 craft-fonts（CRAFT_FONTS_DIR 未设置）");
-            return;
-        }
         let defs = font_definitions();
         let stack = &defs.families[&FontFamily::Proportional];
-        assert!(stack[0].starts_with("LXGW"), "中文面应当排在比例字体最前：{stack:?}");
+        assert_eq!(stack[0], "LXGWWenKai", "内置中文字体应当排在比例字体最前：{stack:?}");
 
         let mut fonts = Fonts::new(TextOptions::default(), defs);
         let id = FontId::proportional(13.0);

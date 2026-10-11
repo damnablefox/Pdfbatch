@@ -81,7 +81,7 @@ cargo build --release          # 产物：target/release/pdfbatch.exe 与 pdfbat
 cargo test                     # 单元测试（核心 + 界面 + 命令行）
 ```
 
-### 依赖与可选输入
+### 依赖
 
 - **PdfCraft 引擎**：通过相对路径依赖 `../pdfcraft`，所以克隆本仓库时请把 PdfCraft 源码放在**同级目录**：
   ```
@@ -89,10 +89,8 @@ cargo test                     # 单元测试（核心 + 界面 + 命令行）
   ├── pdfcraft/     ← 引擎源码（必需）
   └── pdfbatch/     ← 本项目
   ```
-- **中文字体（可选）**：界面中文字体来自 [craft-fonts](https://github.com/storytold/craft-fonts)（霞鹜文楷等，OFL-1.1）。把它克隆到上一级即可自动嵌入；缺字体时构建仍然成功，只是界面中文会退化成缺字方框：
-  ```sh
-  git clone https://github.com/storytold/craft-fonts ../craft-fonts
-  ```
+- **中文字体（已内置）**：界面中文使用**霞鹜文楷**，字体文件随仓库提供（`assets/fonts/LXGWWenKai-Regular.ttf`，SIL OFL 1.1），因此**无需任何额外构建输入**，构建产物一定能正常显示中文。
+  如需换成自己的字体，替换 `assets/fonts/` 下的字体文件并调整 [`crates/ui/src/theme.rs`](crates/ui/src/theme.rs) 的字体栈即可（原来的 [craft-fonts](https://github.com/storytold/craft-fonts) 就是一份类似的、可替换的字库）。
 
 Windows 便携版用**静态 CRT** 构建（`RUSTFLAGS=-C target-feature=+crt-static`），在没有安装 VC++ 运行库的机器上也能直接运行。
 
@@ -207,7 +205,7 @@ $pdfbatch = ".\pdfbatch-cli.exe"
 | 项目 | 链接 | 用途 | 许可 |
 |---|---|---|---|
 | **PdfCraft** | https://github.com/storytold/pdfcraft | PDF 引擎库 crate（对象层、内容流、书签、页面模型）；界面配色/布局/字体规范也参考自它 | MIT OR Apache-2.0 |
-| **craft-fonts** | https://github.com/storytold/craft-fonts | 界面中文字体（霞鹜文楷等，可选构建输入） | SIL OFL 1.1 |
+| **craft-fonts** | https://github.com/storytold/craft-fonts | 内置中文界面字体（霞鹜文楷）的来源 | SIL OFL 1.1 |
 | **LXGW WenKai 霞鹜文楷** | https://github.com/lxgw/LxgwWenKai | 界面中文字面 | SIL OFL 1.1 |
 | **Inter** | https://github.com/rsms/inter | 界面西文字体 | SIL OFL 1.1 |
 | **JetBrains Mono** | https://github.com/JetBrains/JetBrainsMono | 界面等宽字体 | SIL OFL 1.1 |
@@ -216,7 +214,7 @@ $pdfbatch = ".\pdfbatch-cli.exe"
 | **png** | https://github.com/image-rs/image-png | 解码窗口图标 | MIT OR Apache-2.0 |
 | **winresource** | https://github.com/mxre/winres | 在 Windows 构建时嵌入图标与版本信息 | MIT |
 
-字体许可原文随仓库提供：`assets/fonts/OFL-Inter.txt`、`assets/fonts/OFL-JetBrainsMono.txt`。
+字体许可原文随仓库提供：`assets/fonts/OFL-Inter.txt`、`assets/fonts/OFL-JetBrainsMono.txt`、`assets/fonts/OFL-LXGWWenKai.txt`。
 
 ## 贡献者
 

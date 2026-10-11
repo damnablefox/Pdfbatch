@@ -2165,7 +2165,6 @@ dependencies = [
  "egui",
  "egui_extras",
  "pdfbatch-core",
- "pdfcraft-fonts",
  "png",
  "pollster 1.0.1",
  "rfd",
@@ -2204,15 +2203,6 @@ version = "0.5.0"
 dependencies = [
  "flate2",
  "thiserror 2.0.21",
-]
-
-[[package]]
-name = "pdfcraft-fonts"
-version = "0.5.0"
-dependencies = [
- "harfrust",
- "pdfcraft-cos",
- "skrifa",
 ]
 
 [[package]]

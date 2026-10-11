@@ -23,7 +23,6 @@ pdfcraft-content = { path = "../pdfcraft/crates/content" }
 pdfcraft-organize = { path = "../pdfcraft/crates/organize" }
 pdfcraft-model = { path = "../pdfcraft/crates/model" }
 pdfcraft-geom = { path = "../pdfcraft/crates/geom" }
-pdfcraft-fonts = { path = "../pdfcraft/crates/fonts" }
 
 thiserror = "2"
 
