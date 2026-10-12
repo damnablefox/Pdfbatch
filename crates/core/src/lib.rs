@@ -9,13 +9,22 @@ pub mod batch;
 pub mod blend;
 pub mod bookmarks;
 pub mod color;
+pub mod content;
 pub mod error;
 pub mod fill;
 pub mod pages;
+pub mod pagesize;
 pub mod pdf;
+pub mod report;
+pub mod scan;
 pub mod spec;
+pub mod transform;
+pub mod units;
 
-pub use action::{Action, BookmarkSpec, FillOp, Outcome, OutcomeStatus, bookmark_spec, run_jobs};
+pub use action::{
+    Action, BookmarkSpec, FillOp, Outcome, OutcomeStatus, PageRecord, PageSizeMethod, RecordResult,
+    bookmark_spec, run_jobs,
+};
 pub use batch::{Input, Job, Naming, OutputMode};
 pub use blend::Blend;
 pub use error::{BatchError, Result};

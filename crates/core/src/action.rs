@@ -10,6 +10,8 @@ use pdfcraft_cos::Document;
 use crate::batch::{self, Input, Job, OutputMode};
 use crate::error::{BatchError, Result};
 use crate::fill::{FillChange, FillStyle, Matcher};
+use crate::pagesize::{self, ScaleSpec};
+use crate::scan::{self, ScanOutcome, ScanSpec};
 use crate::{bookmarks, fill, pages, pdf, spec};
 
 /// 书签文本的来源：所有文件共用一份，还是按文件分段。
@@ -49,6 +51,25 @@ impl FillOp {
     }
 }
 
+/// 「页面尺寸」的两种做法。
+#[derive(Debug, Clone)]
+pub enum PageSizeMethod {
+    /// 按目标尺寸缩放内容。
+    Scale(ScaleSpec),
+    /// 按扫描件图像适配（页面贴合图像）。
+    Scan(ScanSpec),
+}
+
+impl PageSizeMethod {
+    /// 中文名，用于摘要。
+    pub fn label(&self) -> &'static str {
+        match self {
+            PageSizeMethod::Scale(_) => "缩放",
+            PageSizeMethod::Scan(_) => "扫描件适配",
+        }
+    }
+}
+
 /// 一个文档上要做的动作。
 #[derive(Debug, Clone)]
 pub enum Action {
@@ -66,13 +87,51 @@ pub enum Action {
         /// 页范围原文（`1-5,8,10-` 或 `all`）。
         pages: String,
     },
+    /// 调整指定页的尺寸：按目标尺寸缩放，或按扫描件图像适配。
+    PageSize {
+        method: PageSizeMethod,
+        /// 页范围原文（`1-5,8,10-` 或 `all`）。
+        pages: String,
+    },
 }
 
-/// 一次动作的结果说明：一句摘要，加上不致命的警告。
+/// 一页的处理结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordResult {
+    Done,
+    Skipped,
+    Failed,
+}
+
+impl RecordResult {
+    pub fn label(self) -> &'static str {
+        match self {
+            RecordResult::Done => "成功",
+            RecordResult::Skipped => "跳过",
+            RecordResult::Failed => "失败",
+        }
+    }
+}
+
+/// 一页的处理记录（目前由「页面尺寸」动作填写，供处理日志使用）。
 #[derive(Debug, Clone)]
+pub struct PageRecord {
+    /// 页码（从 1 开始）。
+    pub page: usize,
+    pub result: RecordResult,
+    /// 原因或摘要。
+    pub reason: String,
+    /// 处理后的页面尺寸（点），没有就是 `None`。
+    pub size: Option<(f64, f64)>,
+}
+
+/// 一次动作的结果说明：一句摘要，加上不致命的警告与逐页记录。
+#[derive(Debug, Clone, Default)]
 pub struct RunNote {
     pub summary: String,
     pub warnings: Vec<String>,
+    /// 逐页记录；不需要细分的动作留空。
+    pub records: Vec<PageRecord>,
 }
 
 impl Action {
@@ -101,6 +160,7 @@ impl Action {
                 Ok(RunNote {
                     summary: format!("{verb} {added} 条书签"),
                     warnings: parsed.warnings,
+                    ..Default::default()
                 })
             }
             Action::Fill { op, pages: range } => {
@@ -117,6 +177,7 @@ impl Action {
                                 if *replace { "已替换旧层" } else { "新增" }
                             ),
                             warnings: Vec::new(),
+                            ..Default::default()
                         }
                     }
                     FillOp::Remove(matcher) => {
@@ -125,6 +186,7 @@ impl Action {
                         RunNote {
                             summary: format!("删除了 {removed} 个填充层"),
                             warnings: no_hit_warning(removed),
+                            ..Default::default()
                         }
                     }
                     FillOp::Modify { matcher, change } => {
@@ -137,8 +199,83 @@ impl Action {
                         RunNote {
                             summary: format!("修改了 {changed} 个填充层"),
                             warnings: no_hit_warning(changed),
+                            ..Default::default()
                         }
                     }
+                })
+            }
+            Action::PageSize { method, pages: range } => {
+                let page_count = pdfcraft_organize::page_count(doc)?;
+                let targets = pages::parse_pages(range, page_count).map_err(BatchError::Arg)?;
+                let all = pdfcraft_model::pages(doc);
+                let mut records: Vec<PageRecord> = Vec::with_capacity(targets.len());
+                for &index in &targets {
+                    let page = all
+                        .get(index)
+                        .cloned()
+                        .ok_or_else(|| BatchError::Arg(format!("文档没有第 {} 页", index + 1)))?;
+                    let number = index + 1;
+                    match method {
+                        PageSizeMethod::Scale(spec) => match pagesize::apply_page(doc, &page, spec, true) {
+                            Ok((width, height)) => records.push(PageRecord {
+                                page: number,
+                                result: RecordResult::Done,
+                                reason: format!(
+                                    "{} → {}×{}",
+                                    spec.mode.label(),
+                                    round2(width),
+                                    round2(height)
+                                ),
+                                size: Some((width, height)),
+                            }),
+                            Err(error) => records.push(PageRecord {
+                                page: number,
+                                result: RecordResult::Failed,
+                                reason: error.to_string(),
+                                size: None,
+                            }),
+                        },
+                        PageSizeMethod::Scan(spec) => match scan::apply_page(doc, &page, spec) {
+                            Ok(ScanOutcome::Done {
+                                width,
+                                height,
+                                images,
+                            }) => records.push(PageRecord {
+                                page: number,
+                                result: RecordResult::Done,
+                                reason: format!("贴合 {images} 张图像"),
+                                size: Some((width, height)),
+                            }),
+                            Ok(ScanOutcome::Skipped(why)) => records.push(PageRecord {
+                                page: number,
+                                result: RecordResult::Skipped,
+                                reason: why,
+                                size: None,
+                            }),
+                            Err(error) => records.push(PageRecord {
+                                page: number,
+                                result: RecordResult::Failed,
+                                reason: error.to_string(),
+                                size: None,
+                            }),
+                        },
+                    }
+                }
+                let done = records.iter().filter(|r| r.result == RecordResult::Done).count();
+                let skipped = records.iter().filter(|r| r.result == RecordResult::Skipped).count();
+                let failed = records.iter().filter(|r| r.result == RecordResult::Failed).count();
+                let warnings: Vec<String> = records
+                    .iter()
+                    .filter(|r| r.result != RecordResult::Done)
+                    .map(|r| format!("第 {} 页{}：{}", r.page, r.result.label(), r.reason))
+                    .collect();
+                Ok(RunNote {
+                    summary: format!(
+                        "{}：成功 {done} 页、跳过 {skipped} 页、失败 {failed} 页",
+                        method.label()
+                    ),
+                    warnings,
+                    records,
                 })
             }
         }
@@ -157,7 +294,7 @@ impl Action {
                     }
                 }
             }
-            Action::Bookmarks { .. } => Ok(0),
+            Action::Bookmarks { .. } | Action::PageSize { .. } => Ok(0),
         }
     }
 
@@ -170,6 +307,11 @@ impl Action {
             _ => true,
         }
     }
+}
+
+/// 保留两位小数（日志里显示尺寸用）。
+fn round2(value: f64) -> f64 {
+    (value * 100.0).round() / 100.0
 }
 
 /// 删除/修改命中数为 0 时的提示（不致命，只是提醒条件可能写窄了）。
@@ -230,6 +372,7 @@ pub fn run_jobs<F>(
     output: &OutputMode,
     password: Option<&str>,
     full_save: bool,
+    stop_on_error: bool,
     action: &Action,
     cancel: &AtomicBool,
     mut on_outcome: F,
@@ -262,7 +405,12 @@ where
             status,
         };
         on_outcome(&outcome);
+        let failed = outcome.is_failure();
         outcomes.push(outcome);
+        // 「失败即停」：把取消标志立起来，下一轮循环就会退出（已处理的文件保留）。
+        if stop_on_error && failed {
+            cancel.store(true, Ordering::Relaxed);
+        }
     }
     outcomes
 }
@@ -434,6 +582,42 @@ mod tests {
         };
         let error = modify.run(&mut doc, Path::new("in-memory.pdf")).unwrap_err();
         assert!(matches!(error, BatchError::Arg(_)), "{error}");
+    }
+
+    #[test]
+    fn page_size_scale_reports_one_record_per_page() {
+        let mut doc = two_page_document();
+        let action = Action::PageSize {
+            method: PageSizeMethod::Scale(ScaleSpec {
+                size: (300.0, 400.0),
+                orientation: crate::pagesize::Orientation::Portrait,
+                mode: crate::pagesize::ScaleMode::Fit,
+                percent: 100.0,
+                rotation: crate::pagesize::Rotation::Keep,
+            }),
+            pages: "1".to_string(),
+        };
+        let note = action.run(&mut doc, Path::new("in-memory.pdf")).unwrap();
+        assert!(note.summary.contains("成功 1 页"), "{}", note.summary);
+        assert_eq!(note.records.len(), 1);
+        assert_eq!(note.records[0].page, 1);
+        assert_eq!(note.records[0].result, RecordResult::Done);
+        assert_eq!(note.records[0].size, Some((300.0, 400.0)));
+        assert!(note.warnings.is_empty());
+    }
+
+    #[test]
+    fn page_size_scan_skips_pages_without_images() {
+        let mut doc = two_page_document();
+        let action = Action::PageSize {
+            method: PageSizeMethod::Scan(ScanSpec::default()),
+            pages: "all".to_string(),
+        };
+        let note = action.run(&mut doc, Path::new("in-memory.pdf")).unwrap();
+        assert!(note.summary.contains("跳过 2 页"), "{}", note.summary);
+        assert_eq!(note.records.len(), 2);
+        assert!(note.records.iter().all(|r| r.result == RecordResult::Skipped));
+        assert_eq!(note.warnings.len(), 2, "跳过应当各给一条提示");
     }
 
     #[test]

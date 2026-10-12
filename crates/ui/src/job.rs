@@ -7,25 +7,34 @@ use std::sync::{Arc, Mutex, PoisonError};
 use pdfbatch_core::action::{OutcomeStatus, run_jobs};
 use pdfbatch_core::batch::{self, Input, Job, Naming, OutputMode};
 use pdfbatch_core::spec::{self, SpecSections};
-use pdfbatch_core::{Action, Blend, FillChange, FillOp, FillStyle, Layer, Matcher, RectMatch};
+use pdfbatch_core::pagesize::{Orientation, Rotation, ScaleMode, ScaleSpec};
+use pdfbatch_core::report::LogFormat;
+use pdfbatch_core::scan::{self, ImageRotation, ScanSpec, Strictness};
+use pdfbatch_core::units::{self, Unit};
+use pdfbatch_core::{
+    Action, Blend, FillChange, FillOp, FillStyle, Layer, Matcher, PageSizeMethod, RectMatch,
+};
 
 use crate::files::FileStatus;
 
-/// 两种模式。
+/// 三种模式。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     /// 给页面盖纯色填充层。
     Fill,
+    /// 调整页面尺寸（按目标尺寸缩放，或按扫描件图像适配）。
+    PageSize,
     /// 从文本导入书签。
     Bookmarks,
 }
 
 impl Mode {
-    pub const ALL: [Mode; 2] = [Mode::Fill, Mode::Bookmarks];
+    pub const ALL: [Mode; 3] = [Mode::Fill, Mode::PageSize, Mode::Bookmarks];
 
     pub fn label(self) -> &'static str {
         match self {
             Mode::Fill => "填充区域",
+            Mode::PageSize => "页面尺寸",
             Mode::Bookmarks => "书签",
         }
     }
@@ -34,6 +43,7 @@ impl Mode {
     pub fn suffix(self) -> &'static str {
         match self {
             Mode::Fill => "_filled",
+            Mode::PageSize => "_resized",
             Mode::Bookmarks => "_bookmarked",
         }
     }
@@ -282,6 +292,124 @@ fn pages_text(fill: &FillDraft) -> String {
     }
 }
 
+/// 「页面尺寸」的两种做法。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SizeMethod {
+    /// 按目标尺寸缩放内容。
+    Scale,
+    /// 按扫描件图像适配。
+    Scan,
+}
+
+impl SizeMethod {
+    pub const ALL: [SizeMethod; 2] = [SizeMethod::Scale, SizeMethod::Scan];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SizeMethod::Scale => "按目标尺寸缩放",
+            SizeMethod::Scan => "扫描件适配",
+        }
+    }
+}
+
+/// 目标尺寸的来源：预设纸张，还是自己填宽高。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SizeSource {
+    Preset,
+    Custom,
+}
+
+/// 「页面尺寸」模式的参数草稿。
+#[derive(Clone, Debug)]
+pub struct PageSizeDraft {
+    pub method: SizeMethod,
+
+    // —— 缩放 ——
+    pub source: SizeSource,
+    /// 预设纸张名（如 `A4`）。
+    pub preset: String,
+    /// 自定义宽高（按 `unit` 解释）。
+    pub width: f64,
+    pub height: f64,
+    pub unit: Unit,
+    pub orientation: Orientation,
+    pub scale_mode: ScaleMode,
+    pub percent: f64,
+    pub rotation: Rotation,
+
+    // —— 扫描件适配 ——
+    pub ppi: f64,
+    pub strictness: Strictness,
+    pub merge: bool,
+    pub image_rotation: ImageRotation,
+
+    /// 页范围原文。
+    pub pages: String,
+}
+
+impl Default for PageSizeDraft {
+    fn default() -> Self {
+        Self {
+            method: SizeMethod::Scale,
+
+            source: SizeSource::Preset,
+            preset: "A4".to_string(),
+            width: 210.0,
+            height: 297.0,
+            unit: Unit::Mm,
+            orientation: Orientation::Portrait,
+            scale_mode: ScaleMode::Fit,
+            percent: 100.0,
+            rotation: Rotation::Keep,
+
+            ppi: scan::DEFAULT_PPI,
+            strictness: Strictness::Strict,
+            merge: false,
+            image_rotation: ImageRotation::Auto,
+
+            pages: "all".to_string(),
+        }
+    }
+}
+
+/// 由草稿得出缩放参数；宽高按所选单位换算成点。
+fn scale_spec(draft: &PageSizeDraft) -> std::result::Result<ScaleSpec, String> {
+    let size = match draft.source {
+        SizeSource::Preset => units::preset(&draft.preset)
+            .ok_or_else(|| format!("未知纸张尺寸 `{}`", draft.preset))?,
+        SizeSource::Custom => {
+            if !(draft.width > 0.0 && draft.height > 0.0) {
+                return Err("自定义宽高必须大于 0".to_string());
+            }
+            (draft.unit.to_pt(draft.width), draft.unit.to_pt(draft.height))
+        }
+    };
+    if draft.scale_mode == ScaleMode::Percent && !(draft.percent > 0.0) {
+        return Err("缩放百分比必须大于 0".to_string());
+    }
+    Ok(ScaleSpec {
+        size,
+        orientation: draft.orientation,
+        mode: draft.scale_mode,
+        percent: draft.percent,
+        rotation: draft.rotation,
+    })
+}
+
+/// 由草稿得出扫描件适配参数。
+fn scan_spec(draft: &PageSizeDraft) -> std::result::Result<ScanSpec, String> {
+    if !(draft.ppi.is_finite() && draft.ppi > 0.0) {
+        return Err("PPI 必须大于 0".to_string());
+    }
+    Ok(ScanSpec {
+        ppi: draft.ppi,
+        strictness: draft.strictness,
+        merge: draft.merge,
+        rotation: draft.image_rotation,
+        ..ScanSpec::default()
+    })
+}
+
 /// 书签模式的参数草稿。
 #[derive(Clone, Debug, Default)]
 pub struct BookmarkDraft {
@@ -307,6 +435,10 @@ pub struct CommonOptions {
     pub password: String,
     /// 整体重写文件（体积更小，但会让已有数字签名失效）。
     pub full_save: bool,
+    /// 处理日志格式；`None` 表示不产出日志。位置固定为可执行文件同级目录。
+    pub log: Option<LogFormat>,
+    /// 某个文件失败后是否停止整批。
+    pub stop_on_error: bool,
 }
 
 impl Default for CommonOptions {
@@ -318,6 +450,8 @@ impl Default for CommonOptions {
             suffix: Mode::Fill.suffix().to_string(),
             password: String::new(),
             full_save: false,
+            log: None,
+            stop_on_error: false,
         }
     }
 }
@@ -330,6 +464,9 @@ pub struct Request {
     pub output: OutputMode,
     pub password: Option<String>,
     pub full_save: bool,
+    pub stop_on_error: bool,
+    /// 处理日志格式；`None` 表示不产出。位置是可执行文件同级目录。
+    pub log: Option<LogFormat>,
 }
 
 impl Request {
@@ -345,6 +482,7 @@ impl Request {
 pub fn preflight(
     mode: Mode,
     fill: &FillDraft,
+    pagesize: &PageSizeDraft,
     bookmarks: &BookmarkDraft,
     common: &CommonOptions,
     inputs: &[Input],
@@ -375,6 +513,17 @@ pub fn preflight(
                 validate_page_syntax(&fill.pages)?;
             }
         },
+        Mode::PageSize => {
+            validate_page_syntax(&pagesize.pages)?;
+            match pagesize.method {
+                SizeMethod::Scale => {
+                    scale_spec(pagesize)?;
+                }
+                SizeMethod::Scan => {
+                    scan_spec(pagesize)?;
+                }
+            }
+        }
         Mode::Bookmarks => {
             if bookmarks.text.trim().is_empty() {
                 return Err("书签文本是空的".to_string());
@@ -435,11 +584,12 @@ pub fn effective_naming(mode: Mode, common: &CommonOptions) -> Naming {
 pub fn build_request(
     mode: Mode,
     fill: &FillDraft,
+    pagesize: &PageSizeDraft,
     bookmarks: &BookmarkDraft,
     common: &CommonOptions,
     inputs: Vec<Input>,
 ) -> Result<Request, String> {
-    preflight(mode, fill, bookmarks, common, &inputs)?;
+    preflight(mode, fill, pagesize, bookmarks, common, &inputs)?;
 
     let output = match common.output {
         OutputChoice::SameFolder => OutputMode::SameFolder {
@@ -479,6 +629,20 @@ pub fn build_request(
                 pages: pages_text(fill),
             }
         }
+        Mode::PageSize => {
+            let method = match pagesize.method {
+                SizeMethod::Scale => PageSizeMethod::Scale(scale_spec(pagesize)?),
+                SizeMethod::Scan => PageSizeMethod::Scan(scan_spec(pagesize)?),
+            };
+            Action::PageSize {
+                method,
+                pages: if pagesize.pages.trim().is_empty() {
+                    "all".to_string()
+                } else {
+                    pagesize.pages.clone()
+                },
+            }
+        }
         Mode::Bookmarks => Action::Bookmarks {
             // 有段头就按文件分配；没有段头则所有文件共用这份文本。
             spec: pdfbatch_core::bookmark_spec(&bookmarks.text, &inputs)?,
@@ -499,6 +663,8 @@ pub fn build_request(
         output,
         password,
         full_save: common.full_save,
+        stop_on_error: common.stop_on_error,
+        log: common.log,
     })
 }
 
@@ -539,6 +705,8 @@ pub fn build_probe_request(
         },
         password,
         full_save: false,
+        stop_on_error: false,
+        log: None,
     })
 }
 
@@ -624,6 +792,8 @@ pub fn spawn_job(request: Request, ctx: egui::Context) -> Result<JobRun, String>
     let output = request.output.clone();
     let password = request.password.clone();
     let full_save = request.full_save;
+    let stop_on_error = request.stop_on_error;
+    let log = request.log;
 
     // 先把第一个文件标成"处理中"，让界面一启动就有反馈。
     if let Some(first) = jobs.first() {
@@ -638,11 +808,12 @@ pub fn spawn_job(request: Request, ctx: egui::Context) -> Result<JobRun, String>
         .spawn(move || {
             let jobs_ref = &jobs;
             let mut next = 0usize;
-            run_jobs(
+            let outcomes = run_jobs(
                 jobs_ref,
                 &output,
                 password.as_deref(),
                 full_save,
+                stop_on_error,
                 &action,
                 &cancel_worker,
                 |outcome| {
@@ -670,6 +841,12 @@ pub fn spawn_job(request: Request, ctx: egui::Context) -> Result<JobRun, String>
                     ctx.request_repaint();
                 },
             );
+            // 处理日志：任务结束后一次性落盘（位置是可执行文件同级目录）。
+            if let Some(format) = log {
+                let records = pdfbatch_core::report::collect(&outcomes);
+                let path = pdfbatch_core::report::default_path(format);
+                let _ = pdfbatch_core::report::write(&records, format, &path);
+            }
             if let Ok(mut p) = progress_worker.lock() {
                 p.finished = true;
                 p.cancelled = cancel_worker.load(Ordering::Relaxed);
@@ -768,6 +945,19 @@ mod tests {
             path: PathBuf::from(path),
             relative: PathBuf::from(PathBuf::from(path).file_name().unwrap()),
         }
+    }
+
+    /// 测试用的 build_request：页面尺寸草稿取默认值，省得每个用例都写一遍。
+    ///
+    /// 显式定义会遮蔽 `use super::*` 引入的同名函数，因此测试里的调用无需改动。
+    fn build_request(
+        mode: Mode,
+        fill: &FillDraft,
+        bookmarks: &BookmarkDraft,
+        common: &CommonOptions,
+        inputs: Vec<Input>,
+    ) -> Result<Request, String> {
+        super::build_request(mode, fill, &PageSizeDraft::default(), bookmarks, common, inputs)
     }
 
     fn fill_request(rect_ok: bool, pages: &str) -> Result<Request, String> {
@@ -1091,6 +1281,102 @@ mod tests {
             other => panic!("应当完成，实际 {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pagesize_scale_request_carries_the_target_size() {
+        let pagesize = PageSizeDraft {
+            method: SizeMethod::Scale,
+            preset: "A4".to_string(),
+            scale_mode: ScaleMode::Fill,
+            ..PageSizeDraft::default()
+        };
+        let request = super::build_request(
+            Mode::PageSize,
+            &FillDraft::default(),
+            &pagesize,
+            &BookmarkDraft::default(),
+            &CommonOptions::default(),
+            vec![input("D:/a.pdf")],
+        )
+        .unwrap();
+        match request.action {
+            Action::PageSize {
+                method: PageSizeMethod::Scale(spec),
+                pages,
+            } => {
+                assert_eq!(spec.mode, ScaleMode::Fill);
+                assert!((spec.size.0 - 595.2756).abs() < 0.01, "{:?}", spec.size);
+                assert_eq!(pages, "all");
+            }
+            other => panic!("应当是页面尺寸：{other:?}"),
+        }
+    }
+
+    #[test]
+    fn pagesize_scan_request_uses_ppi_and_strictness() {
+        let pagesize = PageSizeDraft {
+            method: SizeMethod::Scan,
+            ppi: 600.0,
+            strictness: Strictness::Lenient,
+            merge: true,
+            ..PageSizeDraft::default()
+        };
+        let request = super::build_request(
+            Mode::PageSize,
+            &FillDraft::default(),
+            &pagesize,
+            &BookmarkDraft::default(),
+            &CommonOptions::default(),
+            vec![input("D:/a.pdf")],
+        )
+        .unwrap();
+        match request.action {
+            Action::PageSize {
+                method: PageSizeMethod::Scan(spec),
+                ..
+            } => {
+                assert_eq!(spec.ppi, 600.0);
+                assert_eq!(spec.strictness, Strictness::Lenient);
+                assert!(spec.merge);
+            }
+            other => panic!("应当是页面尺寸：{other:?}"),
+        }
+    }
+
+    #[test]
+    fn pagesize_preflight_rejects_bad_input() {
+        let zero_percent = PageSizeDraft {
+            scale_mode: ScaleMode::Percent,
+            percent: 0.0,
+            ..PageSizeDraft::default()
+        };
+        let error = super::build_request(
+            Mode::PageSize,
+            &FillDraft::default(),
+            &zero_percent,
+            &BookmarkDraft::default(),
+            &CommonOptions::default(),
+            vec![input("D:/a.pdf")],
+        )
+        .unwrap_err();
+        assert!(error.contains("百分比"), "{error}");
+
+        let zero_ppi = PageSizeDraft {
+            method: SizeMethod::Scan,
+            ppi: 0.0,
+            ..PageSizeDraft::default()
+        };
+        let error = super::build_request(
+            Mode::PageSize,
+            &FillDraft::default(),
+            &zero_ppi,
+            &BookmarkDraft::default(),
+            &CommonOptions::default(),
+            vec![input("D:/a.pdf")],
+        )
+        .unwrap_err();
+        assert!(error.contains("PPI"), "{error}");
     }
 
     #[test]

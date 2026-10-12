@@ -9,7 +9,8 @@ use std::sync::atomic::AtomicBool;
 
 use pdfbatch_core::action::{OutcomeStatus, read_password_file, run_jobs};
 use pdfbatch_core::batch;
-use pdfbatch_core::{Action, BatchError, FillOp};
+use pdfbatch_core::report;
+use pdfbatch_core::{Action, BatchError, FillOp, PageSizeMethod};
 
 use cli::{Common, Invocation};
 
@@ -54,6 +55,13 @@ fn main() -> ExitCode {
                 pages: args.pages,
             },
         ),
+        Invocation::PageSize(args) => run(
+            args.common,
+            Kind::PageSize {
+                method: args.method,
+                pages: args.pages,
+            },
+        ),
     }
 }
 
@@ -67,6 +75,10 @@ enum Kind {
     },
     Fill {
         op: FillOp,
+        pages: String,
+    },
+    PageSize {
+        method: PageSizeMethod,
         pages: String,
     },
 }
@@ -89,6 +101,7 @@ fn run(common: Common, kind: Kind) -> ExitCode {
             Action::Bookmarks { spec, zero_based, strict, replace }
         }
         Kind::Fill { op, pages } => Action::Fill { op, pages },
+        Kind::PageSize { method, pages } => Action::PageSize { method, pages },
     };
     let jobs = match batch::plan(&inputs, &common.output) {
         Ok(jobs) => jobs,
@@ -109,6 +122,7 @@ fn run(common: Common, kind: Kind) -> ExitCode {
         &common.output,
         password.as_deref(),
         common.full_save,
+        common.stop_on_error,
         &action,
         &cancel,
         |outcome| match &outcome.status {
@@ -144,6 +158,19 @@ fn run(common: Common, kind: Kind) -> ExitCode {
     for outcome in outcomes.iter().filter(|o| o.is_failure()) {
         if let OutcomeStatus::Failed(error) = &outcome.status {
             eprintln!("  {}：{error}", outcome.input.display());
+        }
+    }
+
+    // 处理日志：任务结束后一次性落盘。
+    if let Some(format) = common.log {
+        let records = report::collect(&outcomes);
+        let path = match &common.log_dir {
+            Some(dir) => report::path_in(dir, format),
+            None => report::default_path(format),
+        };
+        match report::write(&records, format, &path) {
+            Ok(()) => println!("处理日志：{}（{} 条）", path.display(), records.len()),
+            Err(error) => eprintln!("写处理日志失败：{error}"),
         }
     }
 

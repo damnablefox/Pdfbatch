@@ -15,10 +15,10 @@ use pdfcraft_cos::{Dict, Document, Object, Stream};
 use pdfcraft_model::{Page, pages};
 
 use crate::blend::Blend;
+use crate::content::{page_contents, set_page_contents, stream_tag, tagged};
 use crate::error::{BatchError, Result};
 
-/// 标记键与两个标记值：填充层、包裹原有内容的 q/Q 对。
-const MARK_KEY: &[u8] = b"PBMark";
+/// 两个标记值：填充层、包裹原有内容的 q/Q 对。
 const MARK_FILL: &str = "PBFill";
 const MARK_WRAP: &str = "PBWrap";
 /// 属性字典的键（旧版本没有它）。
@@ -355,7 +355,7 @@ fn page_owned_dict(doc: &Document, page: &Page, key: &[u8]) -> Dict {
 /// - `Bottom`：插到最前；
 /// - `Top`：先把页面原有内容用 q/Q 包住（隔离图形状态，避免颜色与状态"渗出"），再追加到末尾。
 fn place(doc: &mut Document, page: &Page, content: Vec<u8>, info: &FillInfo) -> Result<()> {
-    let mut list = contents(doc, page)?;
+    let mut list = page_contents(doc, page)?;
     let mark = Object::Ref(doc.add(Object::Stream(Stream::flate(tagged_fill(info), &content))));
 
     if info.layer == Layer::Bottom {
@@ -381,8 +381,7 @@ fn place(doc: &mut Document, page: &Page, content: Vec<u8>, info: &FillInfo) -> 
         list.push(mark);
     }
 
-    doc.update_dict(page.obj, |d| d.set(b"Contents".to_vec(), Object::Array(list)))?;
-    Ok(())
+    set_page_contents(doc, page, list)
 }
 
 /// 摘掉本工具此前加在该页的填充层，返回移除的层数。
@@ -391,7 +390,7 @@ fn strip(doc: &mut Document, page: &Page) -> Result<usize> {
 }
 
 fn remove_on_page(doc: &mut Document, page: &Page, matcher: &Matcher) -> Result<usize> {
-    let list = contents(doc, page)?;
+    let list = page_contents(doc, page)?;
     let layers = describe(doc, page, &list)?;
     let doomed: Vec<usize> = layers
         .iter()
@@ -411,7 +410,7 @@ fn remove_on_page(doc: &mut Document, page: &Page, matcher: &Matcher) -> Result<
     if !kept.iter().any(|o| stream_tag(doc, o).as_deref() == Some(MARK_FILL)) {
         kept.retain(|o| stream_tag(doc, o).as_deref() != Some(MARK_WRAP));
     }
-    doc.update_dict(page.obj, |d| d.set(b"Contents".to_vec(), Object::Array(kept)))?;
+    set_page_contents(doc, page, kept)?;
     Ok(doomed.len())
 }
 
@@ -421,7 +420,7 @@ fn modify_on_page(
     matcher: &Matcher,
     change: &FillChange,
 ) -> Result<usize> {
-    let list = contents(doc, page)?;
+    let list = page_contents(doc, page)?;
     let hit: Vec<LayerEntry> = describe(doc, page, &list)?
         .into_iter()
         .filter(|l| matcher.matches(&l.info))
@@ -463,7 +462,7 @@ fn modify_on_page(
 
 /// 按每层记录的层级重排 `/Contents`：底层在前、原文居中、顶层在后。
 fn reorder(doc: &mut Document, page: &Page) -> Result<()> {
-    let list = contents(doc, page)?;
+    let list = page_contents(doc, page)?;
     let entries = describe(doc, page, &list)?;
     let mut out: Vec<Object> = Vec::with_capacity(list.len());
     // 底层填充放在最前。
@@ -480,8 +479,7 @@ fn reorder(doc: &mut Document, page: &Page) -> Result<()> {
     for entry in entries.iter().filter(|e| e.info.layer == Layer::Top) {
         out.push(entry.object.clone());
     }
-    doc.update_dict(page.obj, |d| d.set(b"Contents".to_vec(), Object::Array(out)))?;
-    Ok(())
+    set_page_contents(doc, page, out)
 }
 
 /// 页面上的一条填充层：在 `/Contents` 里的下标、对象引用、属性。
@@ -494,7 +492,7 @@ struct LayerEntry {
 /// 列出页面上所有填充层。属性优先取 `/PBInfo`，旧文件回退解析内容流；
 /// 层序按它在 `/Contents` 里的位置判定（原文之前的算底层）。
 fn fill_layers(doc: &mut Document, page: &Page) -> Result<Vec<LayerEntry>> {
-    let list = contents(doc, page)?;
+    let list = page_contents(doc, page)?;
     describe(doc, page, &list)
 }
 
@@ -606,42 +604,11 @@ fn parse_state_name(name: &str) -> Option<(Blend, f64)> {
     Some((blend, opacity / 100.0))
 }
 
-/// 页面 `/Contents` 的流引用列表。
-///
-/// 四种形态都要处理：缺失、间接引用指向数组、数组、单个流（提升为间接对象）。
-fn contents(doc: &mut Document, page: &Page) -> Result<Vec<Object>> {
-    let dict = doc.get(page.obj).as_dict().cloned().unwrap_or_default();
-    Ok(match dict.get(b"Contents").cloned() {
-        None => Vec::new(),
-        Some(Object::Ref(r)) => match doc.get(r).as_array() {
-            Some(array) => array.clone(),
-            None => vec![Object::Ref(r)],
-        },
-        Some(Object::Array(array)) => array,
-        Some(other) => vec![Object::Ref(doc.add(other))],
-    })
-}
-
-/// 带标记的流字典。
-fn tagged(tag: &str) -> Dict {
-    let mut dict = Dict::new();
-    dict.set(MARK_KEY.to_vec(), Object::name(tag));
-    dict
-}
-
 /// 带标记与属性字典的填充流字典。
 fn tagged_fill(info: &FillInfo) -> Dict {
     let mut dict = tagged(MARK_FILL);
     dict.set(INFO_KEY.to_vec(), Object::Dict(info.to_dict()));
     dict
-}
-
-/// 读一个对象（流）字典里的标记，不解压内容。
-fn stream_tag(doc: &Document, object: &Object) -> Option<String> {
-    doc.resolve(object)
-        .as_dict()?
-        .name(MARK_KEY)
-        .map(|name| String::from_utf8_lossy(name).into_owned())
 }
 
 /// 生成填充用的内容流。首字节是换行，避免与上一段流末尾的记号粘连。

@@ -17,13 +17,17 @@ use std::time::Duration;
 
 use eframe::egui;
 
+use pdfbatch_core::pagesize::{Orientation, Rotation, ScaleMode};
+use pdfbatch_core::report::LogFormat;
+use pdfbatch_core::scan::{ImageRotation, Strictness};
 use pdfbatch_core::spec::SpecEntry;
+use pdfbatch_core::units::Unit;
 use pdfbatch_core::{Blend, Layer};
 
 use files::{FileList, FileStatus};
 use job::{
     BookmarkDraft, ChangeRect, CommonOptions, FillAction, FillDraft, JobProgress, MatchRect, Mode,
-    OutputChoice,
+    OutputChoice, PageSizeDraft, SizeMethod, SizeSource,
 };
 use pickers::{PickPurpose, Pickers};
 use theme::{ThemeKind, Tokens};
@@ -99,6 +103,7 @@ pub struct App {
     applied: Option<ThemeKind>,
     files: FileList,
     fill: FillDraft,
+    pagesize: PageSizeDraft,
     bookmarks: BookmarkDraft,
     common: CommonOptions,
     pickers: Pickers,
@@ -128,6 +133,7 @@ impl Default for App {
             applied: None,
             files: FileList::default(),
             fill: FillDraft::default(),
+            pagesize: PageSizeDraft::default(),
             bookmarks: BookmarkDraft::default(),
             common: CommonOptions::default(),
             pickers: Pickers::default(),
@@ -388,7 +394,14 @@ impl App {
             return;
         }
         let inputs = self.files.to_inputs();
-        match job::build_request(self.mode, &self.fill, &self.bookmarks, &self.common, inputs) {
+        match job::build_request(
+            self.mode,
+            &self.fill,
+            &self.pagesize,
+            &self.bookmarks,
+            &self.common,
+            inputs,
+        ) {
             Ok(request) => match job::spawn_job(request, ctx.clone()) {
                 Ok(run) => {
                     self.files.reset_statuses();
@@ -500,6 +513,7 @@ impl App {
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             match self.mode {
                 Mode::Fill => self.fill_params(ui, t),
+                Mode::PageSize => self.pagesize_params(ui, t),
                 Mode::Bookmarks => self.bookmark_params(ui, t),
             }
             ui.add_space(16.0);
@@ -737,6 +751,181 @@ impl App {
             if self.fill.change_layer_on {
                 ui.selectable_value(&mut self.fill.change_layer, Layer::Top, "顶层");
                 ui.selectable_value(&mut self.fill.change_layer, Layer::Bottom, "底层");
+            }
+        });
+    }
+
+    /// 「页面尺寸」模式的参数：先选方式，再填各自参数，最后是作用范围。
+    fn pagesize_params(&mut self, ui: &mut egui::Ui, t: Tokens) {
+        widgets::section_title(ui, "方式");
+        ui.horizontal(|ui| {
+            for method in SizeMethod::ALL {
+                ui.selectable_value(&mut self.pagesize.method, method, method.label());
+            }
+        });
+        ui.add_space(6.0);
+
+        match self.pagesize.method {
+            SizeMethod::Scale => self.pagesize_scale(ui, t),
+            SizeMethod::Scan => self.pagesize_scan(ui, t),
+        }
+
+        widgets::section_title(ui, "作用范围");
+        ui.horizontal(|ui| {
+            ui.label("页范围");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.pagesize.pages)
+                    .hint_text("all、1-5,8、odd、even、all except first,last")
+                    .desired_width(180.0),
+            );
+        });
+        if let Err(message) = job::validate_page_syntax(&self.pagesize.pages) {
+            ui.label(egui::RichText::new(message).font(regular(11.5)).color(danger()));
+        }
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new("这些参数会应用到左侧列表里的所有文件。")
+                .font(regular(11.5))
+                .color(t.text_faint),
+        );
+    }
+
+    /// 缩放方式的参数。
+    fn pagesize_scale(&mut self, ui: &mut egui::Ui, t: Tokens) {
+        widgets::section_title(ui, "目标尺寸");
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.pagesize.source, SizeSource::Preset, "预设");
+            ui.selectable_value(&mut self.pagesize.source, SizeSource::Custom, "自定义");
+        });
+        match self.pagesize.source {
+            SizeSource::Preset => {
+                ui.horizontal(|ui| {
+                    ui.label("纸张");
+                    egui::ComboBox::from_id_salt("pagesize-preset")
+                        .width(120.0)
+                        .selected_text(self.pagesize.preset.clone())
+                        .show_ui(ui, |ui| {
+                            for name in pdfbatch_core::units::preset_names() {
+                                ui.selectable_value(&mut self.pagesize.preset, name.to_string(), name);
+                            }
+                        });
+                });
+                if let Some((w, h)) = pdfbatch_core::units::preset(&self.pagesize.preset) {
+                    ui.label(
+                        egui::RichText::new(format!("{w:.2} × {h:.2} pt"))
+                            .font(regular(11.0))
+                            .color(t.text_faint),
+                    );
+                }
+            }
+            SizeSource::Custom => {
+                ui.horizontal(|ui| {
+                    ui.label("宽");
+                    ui.add(egui::DragValue::new(&mut self.pagesize.width).speed(1.0).range(1.0..=20000.0));
+                    ui.label("高");
+                    ui.add(egui::DragValue::new(&mut self.pagesize.height).speed(1.0).range(1.0..=20000.0));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("单位");
+                    for unit in [Unit::Pt, Unit::Mm, Unit::Cm, Unit::In] {
+                        ui.selectable_value(&mut self.pagesize.unit, unit, unit.canonical());
+                    }
+                });
+            }
+        }
+        ui.horizontal(|ui| {
+            ui.label("方向");
+            for (value, label) in [
+                (Orientation::Portrait, "纵向"),
+                (Orientation::Landscape, "横向"),
+                (Orientation::Auto, "跟随原页面"),
+            ] {
+                ui.selectable_value(&mut self.pagesize.orientation, value, label);
+            }
+        });
+
+        widgets::section_title(ui, "缩放模式");
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("pagesize-mode")
+                .width(180.0)
+                .selected_text(self.pagesize.scale_mode.label())
+                .show_ui(ui, |ui| {
+                    for mode in ScaleMode::ALL {
+                        ui.selectable_value(&mut self.pagesize.scale_mode, mode, mode.label());
+                    }
+                });
+        });
+        if self.pagesize.scale_mode == ScaleMode::Percent {
+            ui.horizontal(|ui| {
+                ui.label("百分比");
+                ui.add(
+                    egui::DragValue::new(&mut self.pagesize.percent)
+                        .speed(1.0)
+                        .range(1.0..=1000.0)
+                        .suffix("%"),
+                );
+            });
+        }
+
+        widgets::section_title(ui, "旋转");
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(&mut self.pagesize.rotation, Rotation::Keep, "保持");
+            for deg in [0_i64, 90, 180, 270] {
+                ui.selectable_value(&mut self.pagesize.rotation, Rotation::Set(deg), format!("{deg}°"));
+            }
+        });
+        ui.label(
+            egui::RichText::new("选 0° 即把 /Rotate 归零、旋转并入内容变换")
+                .font(regular(11.0))
+                .color(t.text_faint),
+        );
+    }
+
+    /// 扫描件适配方式的参数。
+    fn pagesize_scan(&mut self, ui: &mut egui::Ui, t: Tokens) {
+        widgets::section_title(ui, "扫描件适配");
+        ui.label(
+            egui::RichText::new("让页面尺寸贴合页面上的图像（像素 ÷ PPI × 72），四周不留白。")
+                .font(regular(11.0))
+                .color(t.text_muted),
+        );
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label("PPI");
+            ui.add(egui::DragValue::new(&mut self.pagesize.ppi).speed(1.0).range(1.0..=2400.0));
+        });
+        ui.horizontal(|ui| {
+            ui.label("检测严格度");
+            ui.selectable_value(&mut self.pagesize.strictness, Strictness::Strict, "严格");
+            ui.selectable_value(&mut self.pagesize.strictness, Strictness::Lenient, "宽松");
+        });
+        ui.label(
+            egui::RichText::new(if self.pagesize.strictness == Strictness::Strict {
+                "严格：页面恰有一张图像才处理。"
+            } else {
+                "宽松：忽略小图・水印・背景后，恰有一张图像才处理。"
+            })
+            .font(regular(11.0))
+            .color(t.text_faint),
+        );
+        ui.add_space(4.0);
+        ui.checkbox(&mut self.pagesize.merge, "多张图时按「图像合集外框」适配");
+        ui.label(
+            egui::RichText::new("不做像素级拼合：图与图之间的空隙会变成页面内部留白。")
+                .font(regular(11.0))
+                .color(t.text_faint),
+        );
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label("图像旋转");
+            ui.selectable_value(&mut self.pagesize.image_rotation, ImageRotation::Auto, "自动");
+            ui.selectable_value(&mut self.pagesize.image_rotation, ImageRotation::Keep, "保持");
+            for deg in [0_i64, 90, 180, 270] {
+                ui.selectable_value(
+                    &mut self.pagesize.image_rotation,
+                    ImageRotation::Set(deg),
+                    format!("{deg}°"),
+                );
             }
         });
     }
@@ -1194,6 +1383,30 @@ impl App {
             );
             ui.checkbox(&mut self.common.full_save, "整体重写（更小，可能使签名失效）");
         });
+        // 处理日志与失败处理：三种模式共用。
+        ui.horizontal(|ui| {
+            let mut logging = self.common.log.is_some();
+            if ui.checkbox(&mut logging, "输出处理日志").changed() {
+                self.common.log = logging.then_some(LogFormat::Csv);
+            }
+            if let Some(format) = &mut self.common.log {
+                egui::ComboBox::from_id_salt("pdfbatch-log-format")
+                    .width(80.0)
+                    .selected_text(format.canonical())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(format, LogFormat::Csv, "csv");
+                        ui.selectable_value(format, LogFormat::Json, "json");
+                    });
+            }
+            ui.checkbox(&mut self.common.stop_on_error, "失败即停");
+        });
+        if self.common.log.is_some() {
+            ui.label(
+                egui::RichText::new(format!("日志写到可执行文件同级目录：{}", log_dir_hint()))
+                    .font(regular(11.0))
+                    .color(t.text_faint),
+            );
+        }
     }
 
     /// 文件名前缀 / 后缀：同目录另存与指定目录共用，覆盖原文件时不显示。
@@ -1234,7 +1447,14 @@ impl App {
 
     fn run_bar(&mut self, ui: &mut egui::Ui, t: Tokens) {
         let busy = self.run.is_some();
-        let preflight = job::preflight(self.mode, &self.fill, &self.bookmarks, &self.common, &self.files.to_inputs());
+        let preflight = job::preflight(
+            self.mode,
+            &self.fill,
+            &self.pagesize,
+            &self.bookmarks,
+            &self.common,
+            &self.files.to_inputs(),
+        );
         let progress = self.progress.clone();
         let file_count = self.files.len();
         let mut clicked_run = false;
@@ -1282,10 +1502,18 @@ impl App {
                 ui.add_space(10.0);
                 match &preflight {
                     Ok(()) => {
-                        let (text, color) = if self.mode == Mode::Bookmarks {
-                            (format!("将对 {file_count} 个文件执行「书签」"), t.text_muted)
-                        } else {
-                            match self.fill.action {
+                        let (text, color) = match self.mode {
+                            Mode::Bookmarks => {
+                                (format!("将对 {file_count} 个文件执行「书签」"), t.text_muted)
+                            }
+                            Mode::PageSize => (
+                                format!(
+                                    "将对 {file_count} 个文件执行「页面尺寸 · {}」",
+                                    self.pagesize.method.label()
+                                ),
+                                t.text_muted,
+                            ),
+                            Mode::Fill => match self.fill.action {
                                 FillAction::Add => {
                                     (format!("将对 {file_count} 个文件执行「新增填充层」"), t.text_muted)
                                 }
@@ -1417,6 +1645,14 @@ fn warn() -> egui::Color32 {
 
 fn ok() -> egui::Color32 {
     egui::Color32::from_rgb(0x1E, 0x8E, 0x3E)
+}
+
+/// 处理日志的存放目录（可执行文件同级）。
+fn log_dir_hint() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.display().to_string()))
+        .unwrap_or_else(|| ".".to_string())
 }
 
 /// 混合模式下拉框（新增、查找、更改共用）。

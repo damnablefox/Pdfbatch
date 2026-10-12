@@ -5,10 +5,14 @@ use std::path::PathBuf;
 
 use pdfbatch_core::batch::{Naming, OutputMode};
 use pdfbatch_core::color::parse_color;
-use pdfbatch_core::{Blend, FillChange, FillOp, FillStyle, Layer, Matcher, RectMatch};
+use pdfbatch_core::pagesize::{Orientation, Rotation, ScaleMode, ScaleSpec};
+use pdfbatch_core::report::LogFormat;
+use pdfbatch_core::scan::{self, ImageRotation, ScanSpec, Strictness};
+use pdfbatch_core::units::{self, Unit};
+use pdfbatch_core::{Blend, FillChange, FillOp, FillStyle, Layer, Matcher, PageSizeMethod, RectMatch};
 
 /// 需要取值的开关；其余 `--xxx` 一律当作布尔开关。
-const VALUE_FLAGS: [&str; 24] = [
+const VALUE_FLAGS: &[&str] = &[
     "spec",
     "out",
     "out-dir",
@@ -33,9 +37,24 @@ const VALUE_FLAGS: [&str; 24] = [
     "set-opacity",
     "set-blend",
     "set-layer",
+    // 「页面尺寸」用
+    "size",
+    "width",
+    "height",
+    "unit",
+    "orientation",
+    "mode",
+    "percent",
+    "rotate",
+    "ppi",
+    "strictness",
+    "image-rotate",
+    // 处理日志
+    "log",
+    "log-dir",
 ];
 
-/// 两个子命令共用的参数。
+/// 各子命令共用的参数。
 pub struct Common {
     pub inputs: Vec<PathBuf>,
     pub output: OutputMode,
@@ -43,6 +62,12 @@ pub struct Common {
     pub full_save: bool,
     /// 目录输入是否递归（`--no-recursive` 关闭）。
     pub recursive: bool,
+    /// 处理日志：`None` 表示不产出日志。
+    pub log: Option<LogFormat>,
+    /// 日志目录（默认是可执行文件同级目录）。
+    pub log_dir: Option<PathBuf>,
+    /// 某个文件失败后是否停止整批。
+    pub stop_on_error: bool,
 }
 
 /// `bookmarks` 子命令的参数。
@@ -63,9 +88,18 @@ pub struct Fill {
     pub pages: String,
 }
 
+/// `pagesize` 子命令的参数。
+pub struct PageSize {
+    pub common: Common,
+    pub method: PageSizeMethod,
+    /// 页范围原文，处理时按各文档的实际页数解析。
+    pub pages: String,
+}
+
 pub enum Invocation {
     Bookmarks(Bookmarks),
     Fill(Fill),
+    PageSize(PageSize),
     Help,
 }
 
@@ -79,8 +113,137 @@ pub fn parse(args: &[String]) -> Result<Invocation, String> {
     match subcommand.as_str() {
         "bookmarks" | "bookmark" => parse_bookmarks(raw).map(Invocation::Bookmarks),
         "fill" => parse_fill(raw).map(Invocation::Fill),
-        other => Err(format!("未知子命令 `{other}`；可用：bookmarks、fill。用 --help 查看用法")),
+        "pagesize" | "size" => parse_pagesize(raw).map(Invocation::PageSize),
+        other => Err(format!(
+            "未知子命令 `{other}`；可用：bookmarks、fill、pagesize。用 --help 查看用法"
+        )),
     }
+}
+
+/// `pagesize` 子命令：默认按目标尺寸缩放，`--scan` 切到扫描件适配。
+fn parse_pagesize(raw: RawArgs) -> Result<PageSize, String> {
+    let common = common_args(&raw, "_resized")?;
+    let pages = raw.value("pages").unwrap_or("all").to_string();
+    let method = if raw.has("scan") {
+        reject_scale_flags(&raw)?;
+        PageSizeMethod::Scan(parse_scan(&raw)?)
+    } else {
+        reject_scan_flags(&raw)?;
+        PageSizeMethod::Scale(parse_scale(&raw)?)
+    };
+    Ok(PageSize {
+        common,
+        method,
+        pages,
+    })
+}
+
+/// 缩放参数（默认方式）。
+fn parse_scale(raw: &RawArgs) -> Result<ScaleSpec, String> {
+    let size = match (raw.value("size"), raw.value("width"), raw.value("height")) {
+        (Some(_), _, _) if raw.value("width").is_some() || raw.value("height").is_some() => {
+            return Err("--size 与 --width/--height 不能同时使用".to_string())
+        }
+        (Some(name), _, _) => units::preset(name)
+            .ok_or_else(|| format!("未知纸张尺寸 `{name}`；可用：{}", units::preset_names().join("、")))?,
+        (None, Some(w), Some(h)) => {
+            let unit = match raw.value("unit") {
+                Some(text) => Unit::parse(text)?,
+                None => Unit::Mm,
+            };
+            (unit.to_pt(parse_number(w, "--width")?), unit.to_pt(parse_number(h, "--height")?))
+        }
+        _ => return Err("需要 --size <纸张> 或同时给 --width 与 --height".to_string()),
+    };
+    let orientation = match raw.value("orientation") {
+        Some(text) => Orientation::parse(text)?,
+        None => Orientation::Portrait,
+    };
+    let mode = match raw.value("mode") {
+        Some(text) => ScaleMode::parse(text)?,
+        None => ScaleMode::Fit,
+    };
+    let percent = match raw.value("percent") {
+        Some(text) => parse_number(text, "--percent")?,
+        None => 100.0,
+    };
+    if mode == ScaleMode::Percent && percent <= 0.0 {
+        return Err("--percent 必须为正数".to_string());
+    }
+    let rotation = match raw.value("rotate") {
+        Some(text) => Rotation::parse(text)?,
+        None => Rotation::Keep,
+    };
+    Ok(ScaleSpec {
+        size,
+        orientation,
+        mode,
+        percent,
+        rotation,
+    })
+}
+
+/// 扫描件适配参数（`--scan`）。
+fn parse_scan(raw: &RawArgs) -> Result<ScanSpec, String> {
+    let ppi = match raw.value("ppi") {
+        Some(text) => {
+            let value = parse_number(text, "--ppi")?;
+            if value <= 0.0 {
+                return Err("--ppi 必须为正数".to_string());
+            }
+            value
+        }
+        None => scan::DEFAULT_PPI,
+    };
+    let strictness = match raw.value("strictness") {
+        Some(text) => Strictness::parse(text)?,
+        None => Strictness::Strict,
+    };
+    let rotation = match raw.value("image-rotate") {
+        Some(text) => ImageRotation::parse(text)?,
+        None => ImageRotation::Auto,
+    };
+    Ok(ScanSpec {
+        ppi,
+        strictness,
+        merge: raw.has("merge-images"),
+        rotation,
+        ..ScanSpec::default()
+    })
+}
+
+/// 扫描模式下，缩放专用开关没有意义。
+fn reject_scale_flags(raw: &RawArgs) -> Result<(), String> {
+    const SCALE: [&str; 7] = ["size", "width", "height", "unit", "orientation", "mode", "percent"];
+    for key in SCALE {
+        if raw.has(key) || raw.value(key).is_some() {
+            return Err(format!("--scan 模式不能用 `--{key}`（它只属于缩放方式）"));
+        }
+    }
+    Ok(())
+}
+
+/// 缩放模式下，扫描专用开关没有意义。
+fn reject_scan_flags(raw: &RawArgs) -> Result<(), String> {
+    const SCAN: [&str; 4] = ["ppi", "strictness", "image-rotate", "merge-images"];
+    for key in SCAN {
+        if raw.has(key) || raw.value(key).is_some() {
+            return Err(format!("`--{key}` 只在 --scan 模式下有效"));
+        }
+    }
+    Ok(())
+}
+
+/// 解析一个有限数字。
+fn parse_number(text: &str, flag: &str) -> Result<f64, String> {
+    let value: f64 = text
+        .trim()
+        .parse()
+        .map_err(|_| format!("{flag} 的值 `{text}` 不是数字"))?;
+    if !value.is_finite() {
+        return Err(format!("{flag} 的值必须是有限数"));
+    }
+    Ok(value)
 }
 
 fn parse_bookmarks(raw: RawArgs) -> Result<Bookmarks, String> {
@@ -353,6 +516,12 @@ fn common_args(raw: &RawArgs, default_suffix: &str) -> Result<Common, String> {
         password_file: raw.value("password-file").map(PathBuf::from),
         full_save: raw.has("full-save"),
         recursive: !raw.has("no-recursive"),
+        log: match raw.value("log") {
+            Some(text) => Some(LogFormat::parse(text)?),
+            None => None,
+        },
+        log_dir: raw.value("log-dir").map(PathBuf::from),
+        stop_on_error: raw.has("stop-on-error"),
     })
 }
 
@@ -454,8 +623,10 @@ pub fn help() -> String {
   pdfbatch fill      <输入.pdf|目录>… [--rect x,y,宽,高 | --full-page] [选项]
   pdfbatch fill      <输入.pdf|目录>… --erase  [匹配条件] [选项]
   pdfbatch fill      <输入.pdf|目录>… --modify [匹配条件] [--set-* …] [选项]
+  pdfbatch pagesize  <输入.pdf|目录>… --size A4 [--mode fit] [选项]
+  pdfbatch pagesize  <输入.pdf|目录>… --scan [--ppi 300] [选项]
 
-两个子命令都接受多个文件或目录；目录默认递归收集其中的 .pdf。
+各子命令都接受多个文件或目录；目录默认递归收集其中的 .pdf。
 默认不会改动原文件，而是在同目录另存（文件名加后缀）；用 --in-place 才覆盖原文件。
 
 bookmarks 专用：
@@ -513,9 +684,33 @@ fill 专用 —— 三种操作，默认「新增」：
   --set-layer <层级>      改成这个层级
 
   --pages <范围>      要处理的页，例如 1-5,8,10- ；默认 all
-                      也支持相对写法：all except first,last、-1（末页）、2..-2
+                      也支持相对写法：all except first,last、-1（末页）、2..-2、odd、even
+
+pagesize 专用 —— 两种方式，默认「按目标尺寸缩放」，加 --scan 切到「扫描件适配」：
+
+  缩放（改页面尺寸，内容按所选模式缩放）：
+  --size <纸张>       预设尺寸：A0–A6、Letter、Legal、Tabloid
+  --width <宽> --height <高>   自定义尺寸（默认单位 mm，用 --unit 改）
+  --unit <单位>       pt / mm / cm / in（默认 mm，仅配合 --width/--height）
+  --orientation <方向>  portrait 纵向（默认）/ landscape 横向 / auto 跟随原页面
+  --mode <模式>       fit 适应页面（默认）/ fill 填充页面 / stretch 内容拉伸 /
+                      percent 自定义比例 / resize 只改页面尺寸 /
+                      fit-width 适应宽度 / fit-height 适应高度
+  --percent <百分比>  配合 --mode percent，如 150
+  --rotate <旋转>     keep 保持原 /Rotate（默认）/ 0 / 90 / 180 / 270
+                      选 0 就是「把 /Rotate 归零并并入内容变换」
+
+  扫描件适配（页面尺寸贴合页面上的图像，四周不留白）：
+  --scan              启用扫描件适配
+  --ppi <数值>        PPI，默认 300
+  --strictness <档>   strict 严格（页面恰有一张图，默认）/ lenient 宽松（忽略小图・水印・背景）
+  --merge-images      多张图时按「图像合集外框」适配（默认跳过多图页面）
+  --image-rotate <旋转>  auto 自动（默认）/ keep 保持 / 0 / 90 / 180 / 270
 
 共用：
+  --log <格式>        产出处理日志：csv 或 json；默认写到可执行文件同级目录
+  --log-dir <目录>    处理日志的存放目录（默认是可执行文件同级目录）
+  --stop-on-error     某个文件失败后停止整批（默认继续下一个）
   --out <文件>        写到指定文件（只允许单个输入）
   --out-dir <目录>    写到指定目录（目录输入会保留其相对子路径）
   --in-place          覆盖原文件（先写临时文件，再原子替换）
@@ -532,6 +727,8 @@ fill 专用 —— 三种操作，默认「新增」：
   pdfbatch fill "D:\a.pdf" --rect "72,72,400,120" --layer bottom --pages "1-5,8" --in-place
   pdfbatch fill "D:\pdfs" --erase --match-color "255,224,140" --pages "all except first,last"
   pdfbatch fill "D:\pdfs" --modify --match-blend Multiply --set-opacity 0.5 --set-layer bottom
+  pdfbatch pagesize "D:\a.pdf" --size A4 --mode fit --pages "all" --in-place
+  pdfbatch pagesize "D:\scans" --scan --ppi 300 --out-dir "D:\out" --log csv
 "##,
         pdfbatch_core::blend::BLEND_NAMES.join("、")
     )
@@ -769,6 +966,109 @@ mod tests {
         assert!(parse(&args(&["bookmarks", "D:/a.pdf"])).is_err(), "缺 --spec 应当报错");
         assert!(matches!(parse(&args(&["--help"])).unwrap(), Invocation::Help));
         assert!(parse(&args(&["nope", "D:/a.pdf"])).is_err());
+    }
+
+    #[test]
+    fn pagesize_parses_scale_options() {
+        let parsed = parse(&args(&[
+            "pagesize", "D:/a.pdf", "--size", "A4", "--mode", "fill", "--orientation", "landscape", "--pages", "odd",
+        ]))
+        .unwrap();
+        match parsed {
+            Invocation::PageSize(p) => {
+                match p.method {
+                    PageSizeMethod::Scale(spec) => {
+                        assert_eq!(spec.mode, ScaleMode::Fill);
+                        assert_eq!(spec.orientation, Orientation::Landscape);
+                        // A4 纵向 210×297 mm ≈ 595.28×841.89 pt。
+                        assert!((spec.size.0 - 595.2756).abs() < 0.01, "{:?}", spec.size);
+                        assert!((spec.size.1 - 841.8898).abs() < 0.01, "{:?}", spec.size);
+                    }
+                    other => panic!("应当是缩放：{other:?}"),
+                }
+                assert_eq!(p.pages, "odd");
+            }
+            _ => panic!("应当是 pagesize"),
+        }
+    }
+
+    #[test]
+    fn pagesize_custom_size_uses_the_unit() {
+        let parsed = parse(&args(&[
+            "pagesize", "D:/a.pdf", "--width", "100", "--height", "200", "--unit", "mm",
+        ]))
+        .unwrap();
+        match parsed {
+            Invocation::PageSize(p) => match p.method {
+                PageSizeMethod::Scale(spec) => {
+                    // 100 mm ≈ 283.46 pt、200 mm ≈ 566.93 pt。
+                    assert!((spec.size.0 - 283.46).abs() < 0.1, "{:?}", spec.size);
+                    assert!((spec.size.1 - 566.93).abs() < 0.1, "{:?}", spec.size);
+                }
+                other => panic!("应当是缩放：{other:?}"),
+            },
+            _ => panic!("应当是 pagesize"),
+        }
+    }
+
+    #[test]
+    fn pagesize_parses_scan_options() {
+        let parsed = parse(&args(&[
+            "pagesize",
+            "D:/a.pdf",
+            "--scan",
+            "--ppi",
+            "600",
+            "--strictness",
+            "lenient",
+            "--merge-images",
+            "--image-rotate",
+            "90",
+        ]))
+        .unwrap();
+        match parsed {
+            Invocation::PageSize(p) => match p.method {
+                PageSizeMethod::Scan(spec) => {
+                    assert_eq!(spec.ppi, 600.0);
+                    assert_eq!(spec.strictness, Strictness::Lenient);
+                    assert!(spec.merge);
+                    assert_eq!(spec.rotation, ImageRotation::Set(90));
+                }
+                other => panic!("应当是扫描：{other:?}"),
+            },
+            _ => panic!("应当是 pagesize"),
+        }
+    }
+
+    #[test]
+    fn pagesize_rejects_mixed_or_missing_options() {
+        // 两种方式互斥，各自的专属开关不能串用。
+        assert!(parse(&args(&["pagesize", "D:/a.pdf", "--scan", "--size", "A4"])).is_err());
+        assert!(parse(&args(&["pagesize", "D:/a.pdf", "--ppi", "300"])).is_err());
+        assert!(parse(&args(&["pagesize", "D:/a.pdf", "--size", "A4", "--strictness", "strict"])).is_err());
+        // 缩放方式必须给出目标尺寸。
+        assert!(parse(&args(&["pagesize", "D:/a.pdf", "--mode", "fit"])).is_err());
+        // 预设名要认得出来。
+        assert!(parse(&args(&["pagesize", "D:/a.pdf", "--size", "A7"])).is_err());
+        // 只给宽度不给高度也不行。
+        assert!(parse(&args(&["pagesize", "D:/a.pdf", "--width", "100"])).is_err());
+    }
+
+    #[test]
+    fn logging_and_stop_on_error_are_shared_options() {
+        match parse(&args(&["pagesize", "D:/a.pdf", "--size", "A4", "--log", "json", "--stop-on-error"])).unwrap() {
+            Invocation::PageSize(p) => {
+                assert_eq!(p.common.log, Some(LogFormat::Json));
+                assert!(p.common.stop_on_error);
+            }
+            _ => panic!("应当是 pagesize"),
+        }
+        // 日志开关对别的子命令也生效。
+        match parse(&args(&["fill", "D:/a.pdf", "--log", "csv"])).unwrap() {
+            Invocation::Fill(f) => assert_eq!(f.common.log, Some(LogFormat::Csv)),
+            _ => panic!("应当是 fill"),
+        }
+        assert!(parse(&args(&["fill", "D:/a.pdf", "--log", "xml"])).is_err());
     }
 
     #[test]

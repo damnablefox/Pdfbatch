@@ -6,6 +6,7 @@
 //!
 //! - 负索引：`-1` 末页、`-2` 倒数第 2 页；
 //! - 关键字：`first`（=1）、`last`（=-1）；
+//! - 奇偶页：`odd`（第 1、3、5… 页）、`even`（第 2、4、6… 页）；
 //! - 新范围符 `..`，端点可为负数：`2..-2`（第 2 页到倒数第 2 页）、`5..`（到末页）；
 //! - 排除：`all except first,last`（跳过封面封底）、`1..100 except 1,-1`；
 //! - 旧写法 `1-5,8,10-` 完全兼容。
@@ -41,8 +42,14 @@ fn parse_set(text: &str, page_count: usize) -> std::result::Result<Vec<usize>, S
     Ok(out)
 }
 
-/// 把一个「项」解析成 0 基页索引列表：单页、`a..b`、`a-b`（旧式）。
+/// 把一个「项」解析成 0 基页索引列表：`odd`/`even`、单页、`a..b`、`a-b`（旧式）。
 fn parse_item(part: &str, page_count: usize) -> std::result::Result<Vec<usize>, String> {
+    // 奇偶页：`odd` = 第 1、3、5… 页（0 基偶数索引），`even` = 第 2、4、6… 页。
+    if let Some(odd) = parse_parity(part) {
+        return Ok((0..page_count)
+            .filter(|index| ((index + 1) % 2 == 1) == odd)
+            .collect());
+    }
     // 新范围符 `..`：端点可以是负数、`first`/`last`，终点留空表示到末页。
     if let Some((start_text, end_text)) = part.split_once("..") {
         let (start, end) = parse_range_ends(start_text, end_text, part, page_count)?;
@@ -126,6 +133,15 @@ fn parse_page(text: &str, part: &str, page_count: usize) -> std::result::Result<
     Ok(n)
 }
 
+/// 识别奇偶页关键字：`odd`（奇数页）返回 `Some(true)`，`even`（偶数页）返回 `Some(false)`。
+fn parse_parity(text: &str) -> Option<bool> {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "odd" | "奇数页" | "奇数" => Some(true),
+        "even" | "偶数页" | "偶数" => Some(false),
+        _ => None,
+    }
+}
+
 /// 形如 `-3`（整体是一个负索引页码）而不是范围。
 fn is_negative_page(text: &str) -> bool {
     text.strip_prefix('-')
@@ -205,6 +221,22 @@ mod tests {
         assert_eq!(parse_pages("first", 5).unwrap(), vec![0]);
         assert_eq!(parse_pages("-2,-1", 5).unwrap(), vec![3, 4]);
         assert_eq!(parse_pages("LAST", 5).unwrap(), vec![4]);
+    }
+
+    #[test]
+    fn odd_and_even_pages() {
+        // odd = 第 1、3、5… 页；even = 第 2、4、6… 页。
+        assert_eq!(parse_pages("odd", 6).unwrap(), vec![0, 2, 4]);
+        assert_eq!(parse_pages("odd", 5).unwrap(), vec![0, 2, 4]);
+        assert_eq!(parse_pages("even", 5).unwrap(), vec![1, 3]);
+        assert_eq!(parse_pages("EVEN", 4).unwrap(), vec![1, 3]);
+        assert_eq!(parse_pages("奇数页", 4).unwrap(), vec![0, 2]);
+        assert_eq!(parse_pages("偶数", 4).unwrap(), vec![1, 3]);
+        // 与其他写法混用、以及被 except 排除。
+        assert_eq!(parse_pages("odd,2", 4).unwrap(), vec![0, 1, 2]);
+        assert_eq!(parse_pages("all except odd", 5).unwrap(), vec![1, 3]);
+        // 页数为 0 时是空集。
+        assert_eq!(parse_pages("odd", 0).unwrap(), Vec::<usize>::new());
     }
 
     #[test]

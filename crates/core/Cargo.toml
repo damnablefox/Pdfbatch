@@ -8,6 +8,7 @@ description = "核心逻辑：书签文本批量导入、填充层的批量应�
 
 [dependencies]
 pdfcraft-cos.workspace = true
+pdfcraft-content.workspace = true
 pdfcraft-organize.workspace = true
 pdfcraft-model.workspace = true
 thiserror.workspace = true
