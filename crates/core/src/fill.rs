@@ -108,7 +108,7 @@ pub enum RectMatch {
     Rect([f64; 4]),
 }
 
-/// 查找填充层的条件；`None` 表示该维度不限制。`tolerance` 用于数值比较。
+/// 查找填充层的条件；`None` 表示该维度不限制。
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Matcher {
     pub rect: Option<RectMatch>,
@@ -116,8 +116,10 @@ pub struct Matcher {
     pub opacity: Option<f64>,
     pub blend: Option<Blend>,
     pub layer: Option<Layer>,
-    /// 数值容差（矩形、颜色、透明度都用它）。0 表示精确相等。
-    pub tolerance: f64,
+    /// 尺寸容差（点）；0 表示精确相等。只作用于矩形比较。
+    pub rect_tolerance: f64,
+    /// 颜色与不透明度容差（0–1，逐通道 ±）；0 表示精确相等。
+    pub color_tolerance: f64,
 }
 
 impl Matcher {
@@ -131,16 +133,18 @@ impl Matcher {
     }
 
     fn matches(&self, info: &FillInfo) -> bool {
-        let near = |a: f64, b: f64| (a - b).abs() <= self.tolerance;
+        // 尺寸用点容差，颜色与不透明度用 0–1 容差，两者互不干扰。
+        let near_rect = |a: f64, b: f64| (a - b).abs() <= self.rect_tolerance;
+        let near_color = |a: f64, b: f64| (a - b).abs() <= self.color_tolerance;
         if let Some(rect) = self.rect {
             let ok = match rect {
                 RectMatch::FullPage => info.full_page,
-                RectMatch::Size([w, h]) => near(info.rect[2], w) && near(info.rect[3], h),
+                RectMatch::Size([w, h]) => near_rect(info.rect[2], w) && near_rect(info.rect[3], h),
                 RectMatch::Rect([x, y, w, h]) => {
-                    near(info.rect[0], x)
-                        && near(info.rect[1], y)
-                        && near(info.rect[2], w)
-                        && near(info.rect[3], h)
+                    near_rect(info.rect[0], x)
+                        && near_rect(info.rect[1], y)
+                        && near_rect(info.rect[2], w)
+                        && near_rect(info.rect[3], h)
                 }
             };
             if !ok {
@@ -148,15 +152,15 @@ impl Matcher {
             }
         }
         if let Some(color) = self.color {
-            let same = near(info.color[0], color[0])
-                && near(info.color[1], color[1])
-                && near(info.color[2], color[2]);
+            let same = near_color(info.color[0], color[0])
+                && near_color(info.color[1], color[1])
+                && near_color(info.color[2], color[2]);
             if !same {
                 return false;
             }
         }
         if let Some(opacity) = self.opacity {
-            if !near(info.opacity, opacity) {
+            if !near_color(info.opacity, opacity) {
                 return false;
             }
         }
@@ -757,12 +761,32 @@ mod tests {
     }
 
     #[test]
-    fn tolerance_widens_numeric_matches() {
+    fn rect_tolerance_only_widens_rect_matches() {
         let info = sample_info();
-        let near = Matcher { opacity: Some(0.2504), tolerance: 0.001, ..Matcher::default() };
-        assert!(near.matches(&info));
-        let strict = Matcher { opacity: Some(0.2504), tolerance: 0.0, ..Matcher::default() };
-        assert!(!strict.matches(&info));
+        let near = Matcher { rect: Some(RectMatch::Size([100.4, 50.0])), rect_tolerance: 0.5, ..Matcher::default() };
+        assert!(near.matches(&info), "0.5 点容差应覆盖 0.4 点的偏差");
+        let strict = Matcher { rect: Some(RectMatch::Size([100.4, 50.0])), ..Matcher::default() };
+        assert!(!strict.matches(&info), "默认容差 0 必须精确相等");
+        // 颜色容差是 0–1 量纲，不该把 0.4 点的尺寸偏差判成命中。
+        let color_tol_only =
+            Matcher { rect: Some(RectMatch::Size([100.4, 50.0])), color_tolerance: 1.0, ..Matcher::default() };
+        assert!(!color_tol_only.matches(&info));
+    }
+
+    #[test]
+    fn color_tolerance_only_widens_color_and_opacity_matches() {
+        let info = sample_info();
+        let near_color = Matcher { color: Some([1.0, 0.95, 0.68]), color_tolerance: 0.02, ..Matcher::default() };
+        assert!(near_color.matches(&info), "逐通道 ±0.02 应覆盖 0.01 的偏差");
+        assert!(!Matcher { color: Some([1.0, 0.95, 0.68]), ..Matcher::default() }.matches(&info));
+
+        let near_opacity = Matcher { opacity: Some(0.2504), color_tolerance: 0.001, ..Matcher::default() };
+        assert!(near_opacity.matches(&info));
+        assert!(!Matcher { opacity: Some(0.2504), ..Matcher::default() }.matches(&info));
+
+        // 尺寸容差是点量纲，不该把 0.0004 的不透明度偏差判成命中。
+        let rect_tol_only = Matcher { opacity: Some(0.2504), rect_tolerance: 1.0, ..Matcher::default() };
+        assert!(!rect_tol_only.matches(&info));
     }
 
     #[test]

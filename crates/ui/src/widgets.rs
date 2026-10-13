@@ -94,6 +94,30 @@ pub fn page_preview(ui: &mut egui::Ui, rect: [f64; 4], color: Color32, opacity: 
     ui.label(egui::RichText::new("示意图（按 A4 页估算）").font(theme::regular(10.5)).color(t.text_faint));
 }
 
+/// 一行「标签 + 并排选项」所需的宽度（含按钮内边距与控件间距）。
+///
+/// 用来推算左侧参数面板的最小宽度：只要面板不比它窄，并排选项就不会被挤到下一行。
+pub fn row_width(ui: &egui::Ui, label: &str, options: &[&str], font: egui::FontId) -> f32 {
+    let text_width = |text: &str| {
+        ui.painter()
+            .layout_no_wrap(text.to_owned(), font.clone(), Color32::WHITE)
+            .size()
+            .x
+    };
+    let mut width = 0.0_f32;
+    if !label.is_empty() {
+        width += text_width(label) + ui.spacing().item_spacing.x;
+    }
+    for (index, option) in options.iter().enumerate() {
+        if index > 0 {
+            width += ui.spacing().item_spacing.x;
+        }
+        // 可选中选项用的是按钮内边距（左右各一份）。
+        width += text_width(option) + ui.spacing().button_padding.x * 2.0;
+    }
+    width
+}
+
 /// 底部的浮动提示条（3.5 秒后由调用方清除）。返回它占用的高度，供摆放进度卡参考。
 pub fn toast(ctx: &egui::Context, message: &str) {
     let t = Tokens::get(ctx);

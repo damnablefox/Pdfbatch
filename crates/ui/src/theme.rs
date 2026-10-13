@@ -168,7 +168,9 @@ pub fn apply(ctx: &egui::Context, kind: ThemeKind) {
 
     ctx.global_style_mut(|s| {
         s.spacing.item_spacing = egui::vec2(8.0, 6.0);
-        s.spacing.button_padding = egui::vec2(10.0, 5.0);
+        // 交互控件统一高度、按钮内边距收紧：同一行里标签、按钮、下拉框的文字才在同一基线上。
+        s.spacing.interact_size = egui::vec2(24.0, 22.0);
+        s.spacing.button_padding = egui::vec2(10.0, 3.0);
         s.spacing.menu_margin = egui::Margin::same(6);
         s.spacing.scroll.bar_width = 8.0;
         s.spacing.scroll.floating = true;

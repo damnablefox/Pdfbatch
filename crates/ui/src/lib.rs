@@ -8,6 +8,7 @@
 
 mod files;
 mod job;
+mod palette;
 mod pickers;
 mod theme;
 mod widgets;
@@ -26,8 +27,8 @@ use pdfbatch_core::{Blend, Layer};
 
 use files::{FileList, FileStatus};
 use job::{
-    BookmarkDraft, ChangeRect, CommonOptions, FillAction, FillDraft, JobProgress, MatchRect, Mode,
-    OutputChoice, PageSizeDraft, SizeMethod, SizeSource,
+    BookmarkDraft, ChangeRect, CommonOptions, FillAction, FillDraft, FillEditMode, JobProgress,
+    MatchRect, Mode, OutputChoice, PageSizeDraft, SizeMethod, SizeSource,
 };
 use pickers::{PickPurpose, Pickers};
 use theme::{ThemeKind, Tokens};
@@ -173,14 +174,18 @@ impl eframe::App for App {
 
         egui::Panel::top("pdfbatch-topbar").show(ui, |ui| self.top_bar(ui, t));
         egui::Panel::bottom("pdfbatch-runbar").show(ui, |ui| self.run_bar(ui, t));
+        // 左面板下限取三个标签页里最宽的一行并排选项（按当前字体实测）：
+        // 拖到下限时并排选项也不会被挤到下一行。
         egui::Panel::left("pdfbatch-params")
             .resizable(true)
-            .default_size(340.0)
-            .min_size(300.0)
-            .max_size(470.0)
+            .default_size(360.0)
+            .min_size(params_min_width(ui))
+            .max_size(560.0)
             .show(ui, |ui| self.params_panel(ui, t));
         // 输出区提升为顶层面板（与左侧参数同级）：独占文件列表下方的整条区域，
         // 不再嵌在 CentralPanel 内，避免表格的列宽手柄绘制/交互穿透到输出区。
+        // 高度固定：面板内始终渲染全部选项（当前方式用不到的置灰占位），
+        // 切换输出方式时分隔线不会跳动。
         egui::Panel::bottom("pdfbatch-output").show(ui, |ui| self.output_options(ui, t));
         egui::CentralPanel::default().show(ui, |ui| self.files_area(ui, t));
 
@@ -533,8 +538,6 @@ impl App {
             FillAction::Add => {
                 self.fill_add_style(ui, t);
                 self.fill_pages(ui, t);
-                ui.add_space(4.0);
-                ui.checkbox(&mut self.fill.replace, "先摘掉已有的填充层（替换）");
                 ui.add_space(8.0);
                 ui.label(
                     egui::RichText::new("这些参数会应用到左侧列表里的所有文件。")
@@ -542,41 +545,56 @@ impl App {
                         .color(t.text_faint),
                 );
             }
-            FillAction::Erase => {
+            FillAction::Edit => {
+                // 上半部分：查找条件；下半部分：删改模式与（选「修改」时的）更改要求。
+                widgets::section_title(ui, "尺寸单位");
+                let before = self.fill.unit;
+                if unit_row(ui, &mut self.fill.unit) {
+                    convert_units(&mut self.fill, before);
+                }
                 self.fill_match_options(ui, t);
                 self.fill_pages(ui, t);
                 self.fill_probe_row(ui, t);
-                ui.add_space(8.0);
-                ui.label(
-                    egui::RichText::new("查找后按「执行」删除命中的填充层。")
-                        .font(regular(11.5))
-                        .color(t.text_faint),
-                );
-            }
-            FillAction::Modify => {
-                // 上部分：查找选项；下部分：更改要求。
-                self.fill_match_options(ui, t);
-                self.fill_pages(ui, t);
-                self.fill_probe_row(ui, t);
-                ui.add_space(10.0);
-                widgets::section_title(ui, "更改要求");
-                self.fill_change_options(ui, t);
+
+                widgets::section_title(ui, "删改模式");
+                ui.horizontal(|ui| {
+                    for mode in FillEditMode::ALL {
+                        ui.selectable_value(&mut self.fill.edit_mode, mode, mode.label());
+                    }
+                });
+
+                if self.fill.edit_mode == FillEditMode::Modify {
+                    ui.add_space(10.0);
+                    widgets::section_title(ui, "更改要求");
+                    self.fill_change_options(ui, t);
+                } else {
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new("查找后按「执行」删除命中的填充层。")
+                            .font(regular(11.5))
+                            .color(t.text_faint),
+                    );
+                }
             }
         }
     }
 
     /// 新增模式：要盖上去的填充层样式。
-    fn fill_add_style(&mut self, ui: &mut egui::Ui, t: Tokens) {
+    fn fill_add_style(&mut self, ui: &mut egui::Ui, _t: Tokens) {
         widgets::section_title(ui, "区域");
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.fill.whole_page, true, "整页");
-            ui.selectable_value(&mut self.fill.whole_page, false, "自定义矩形");
+            ui.selectable_value(&mut self.fill.whole_page, true, "整页填充");
+            ui.selectable_value(&mut self.fill.whole_page, false, "自定义矩形填充");
         });
         ui.add_space(6.0);
 
         if !self.fill.whole_page {
+            let before = self.fill.unit;
+            if unit_row(ui, &mut self.fill.unit) {
+                convert_units(&mut self.fill, before);
+            }
             let rect_ok = self.fill.rect[2] > 0.0 && self.fill.rect[3] > 0.0;
-            rect_rows(ui, "fill-rect", &mut self.fill.rect);
+            rect_rows(ui, "fill-rect", &mut self.fill.rect, self.fill.unit);
             if !rect_ok {
                 ui.label(egui::RichText::new("宽和高必须大于 0").font(regular(11.5)).color(danger()));
             }
@@ -585,24 +603,17 @@ impl App {
         widgets::page_preview(ui, self.fill.rect, self.fill.color, self.fill.opacity as f32, self.fill.whole_page);
 
         widgets::section_title(ui, "颜色");
-        ui.horizontal(|ui| {
-            ui.label("颜色");
-            // 用 sRGB 取色控件：返回的就是 sRGB 分量，和 PDF 的 `rg` 语义一致。
-            egui::color_picker::color_edit_button_srgba(ui, &mut self.fill.color, egui::color_picker::Alpha::Opaque);
-            ui.label(egui::RichText::new(hex(self.fill.color)).font(regular(12.0)).color(t.text_muted));
-        });
-        ui.horizontal(|ui| {
-            ui.label("不透明度");
+        // 拾色器常驻在面板里（不用弹层：弹层被点到别处会关闭，拖动色域时容易误触消失）。
+        palette::picker(ui, "fill-color", &mut self.fill.color);
+        labeled_row(ui, "不透明度", |ui| {
             ui.add(egui::Slider::new(&mut self.fill.opacity, 0.0..=1.0).fixed_decimals(2));
         });
 
         widgets::section_title(ui, "混合与层级");
-        ui.horizontal(|ui| {
-            ui.label("混合模式");
+        labeled_row(ui, "混合模式", |ui| {
             blend_combo(ui, "fill-blend", &mut self.fill.blend);
         });
-        ui.horizontal(|ui| {
-            ui.label("层级");
+        labeled_row(ui, "层级", |ui| {
             ui.selectable_value(&mut self.fill.layer, Layer::Top, "置于顶层");
             ui.selectable_value(&mut self.fill.layer, Layer::Bottom, "置于底层");
         });
@@ -611,8 +622,7 @@ impl App {
     /// 作用范围（三种操作共用）。
     fn fill_pages(&mut self, ui: &mut egui::Ui, _t: Tokens) {
         widgets::section_title(ui, "作用范围");
-        ui.horizontal(|ui| {
-            ui.label("页范围");
+        labeled_row(ui, "页范围", |ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut self.fill.pages)
                     .hint_text("all、1-5,8,10-、all except first,last")
@@ -624,11 +634,11 @@ impl App {
         }
     }
 
-    /// 查找条件（删/改模式共用）：填充区域、颜色、透明度、混合模式、层级。
+    /// 查找条件（删改模式）：填充区域（必选）、尺寸容差、颜色与色值容差、不透明度、混合模式、层级。
     fn fill_match_options(&mut self, ui: &mut egui::Ui, t: Tokens) {
         widgets::section_title(ui, "查找条件");
         ui.label(
-            egui::RichText::new("不勾任何项表示匹配本工具加的全部填充层。")
+            egui::RichText::new("「填充区域」必选，取「不限」即不限制尺寸；其余条件不勾选表示不限制。")
                 .font(regular(11.0))
                 .color(t.text_faint),
         );
@@ -640,23 +650,22 @@ impl App {
             }
         });
         match self.fill.match_rect {
-            MatchRect::Size => size_row(ui, &mut self.fill.match_size),
-            MatchRect::Rect => rect_rows(ui, "fill-match-rect", &mut self.fill.match_rect_value),
+            MatchRect::Size => {
+                size_row(ui, &mut self.fill.match_size, self.fill.unit);
+                self.fill_rect_tolerance_row(ui, t);
+            }
+            MatchRect::Rect => {
+                rect_rows(ui, "fill-match-rect", &mut self.fill.match_rect_value, self.fill.unit);
+                self.fill_rect_tolerance_row(ui, t);
+            }
             MatchRect::Any | MatchRect::FullPage => {}
         }
+        ui.checkbox(&mut self.fill.match_color_on, "填充颜色");
+        if self.fill.match_color_on {
+            palette::picker(ui, "fill-match-color", &mut self.fill.match_color);
+        }
         ui.horizontal(|ui| {
-            ui.checkbox(&mut self.fill.match_color_on, "填充颜色");
-            if self.fill.match_color_on {
-                egui::color_picker::color_edit_button_srgba(
-                    ui,
-                    &mut self.fill.match_color,
-                    egui::color_picker::Alpha::Opaque,
-                );
-                ui.label(egui::RichText::new(hex(self.fill.match_color)).font(regular(12.0)).color(t.text_muted));
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut self.fill.match_opacity_on, "透明度");
+            ui.checkbox(&mut self.fill.match_opacity_on, "不透明度");
             if self.fill.match_opacity_on {
                 ui.add(egui::Slider::new(&mut self.fill.match_opacity, 0.0..=1.0).fixed_decimals(2));
             }
@@ -674,11 +683,30 @@ impl App {
                 ui.selectable_value(&mut self.fill.match_layer, Layer::Bottom, "底层");
             }
         });
-        ui.horizontal(|ui| {
-            ui.label("数值容差");
-            ui.add(egui::DragValue::new(&mut self.fill.tolerance).speed(0.001).range(0.0..=1.0));
-            ui.label(egui::RichText::new("0 表示精确相等").font(regular(11.0)).color(t.text_faint));
+        // 色值容差只对颜色与不透明度有意义（两者共用 0–1 归一化容差）。
+        if self.fill.match_color_on || self.fill.match_opacity_on {
+            labeled_row(ui, "色值容差", |ui| {
+                ui.add(egui::DragValue::new(&mut self.fill.color_tolerance).speed(0.005).range(0.0..=1.0));
+            });
+            ui.label(
+                egui::RichText::new("0–1 归一化，逐通道 ±；0 表示精确相等")
+                    .font(regular(11.0))
+                    .color(t.text_faint),
+            );
+        }
+    }
+
+    /// 尺寸容差：单位跟随「尺寸单位」，0 表示精确相等。
+    fn fill_rect_tolerance_row(&mut self, ui: &mut egui::Ui, t: Tokens) {
+        labeled_row(ui, "尺寸容差", |ui| {
+            ui.add(egui::DragValue::new(&mut self.fill.rect_tolerance).speed(0.1).range(0.0..=f64::MAX));
+            ui.label(egui::RichText::new(self.fill.unit.canonical()).color(t.text_muted));
         });
+        ui.label(
+            egui::RichText::new("0 表示精确相等；单位跟随上面的「尺寸单位」")
+                .font(regular(11.0))
+                .color(t.text_faint),
+        );
     }
 
     /// 查找按钮与命中数量提示。
@@ -713,7 +741,7 @@ impl App {
     }
 
     /// 更改要求（改模式）：命中的填充层要改成什么样。
-    fn fill_change_options(&mut self, ui: &mut egui::Ui, t: Tokens) {
+    fn fill_change_options(&mut self, ui: &mut egui::Ui, _t: Tokens) {
         ui.horizontal_wrapped(|ui| {
             ui.label("填充区域");
             for choice in ChangeRect::ALL {
@@ -721,19 +749,12 @@ impl App {
             }
         });
         if self.fill.change_rect == ChangeRect::Rect {
-            rect_rows(ui, "fill-change-rect", &mut self.fill.change_rect_value);
+            rect_rows(ui, "fill-change-rect", &mut self.fill.change_rect_value, self.fill.unit);
         }
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut self.fill.change_color_on, "改成颜色");
-            if self.fill.change_color_on {
-                egui::color_picker::color_edit_button_srgba(
-                    ui,
-                    &mut self.fill.change_color,
-                    egui::color_picker::Alpha::Opaque,
-                );
-                ui.label(egui::RichText::new(hex(self.fill.change_color)).font(regular(12.0)).color(t.text_muted));
-            }
-        });
+        ui.checkbox(&mut self.fill.change_color_on, "改成颜色");
+        if self.fill.change_color_on {
+            palette::picker(ui, "fill-change-color", &mut self.fill.change_color);
+        }
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.fill.change_opacity_on, "改成不透明度");
             if self.fill.change_opacity_on {
@@ -799,10 +820,9 @@ impl App {
         });
         match self.pagesize.source {
             SizeSource::Preset => {
-                ui.horizontal(|ui| {
-                    ui.label("纸张");
+                labeled_row(ui, "纸张", |ui| {
                     egui::ComboBox::from_id_salt("pagesize-preset")
-                        .width(120.0)
+                        .width(160.0)
                         .selected_text(self.pagesize.preset.clone())
                         .show_ui(ui, |ui| {
                             for name in pdfbatch_core::units::preset_names() {
@@ -811,30 +831,33 @@ impl App {
                         });
                 });
                 if let Some((w, h)) = pdfbatch_core::units::preset(&self.pagesize.preset) {
+                    // 毫米和点同时给：毫米方便与实物纸张对照，点便于核对 PDF 内部尺寸。
+                    let mm = |pt: f64| pt / 72.0 * 25.4;
                     ui.label(
-                        egui::RichText::new(format!("{w:.2} × {h:.2} pt"))
-                            .font(regular(11.0))
-                            .color(t.text_faint),
+                        egui::RichText::new(format!(
+                            "{:.2} × {:.2} mm（{w:.2} × {h:.2} pt）",
+                            mm(w),
+                            mm(h)
+                        ))
+                        .font(regular(11.0))
+                        .color(t.text_faint),
                     );
                 }
             }
             SizeSource::Custom => {
-                ui.horizontal(|ui| {
-                    ui.label("宽");
+                labeled_row(ui, "宽 × 高", |ui| {
                     ui.add(egui::DragValue::new(&mut self.pagesize.width).speed(1.0).range(1.0..=20000.0));
-                    ui.label("高");
+                    ui.label("×");
                     ui.add(egui::DragValue::new(&mut self.pagesize.height).speed(1.0).range(1.0..=20000.0));
                 });
-                ui.horizontal(|ui| {
-                    ui.label("单位");
+                labeled_row(ui, "单位", |ui| {
                     for unit in [Unit::Pt, Unit::Mm, Unit::Cm, Unit::In] {
                         ui.selectable_value(&mut self.pagesize.unit, unit, unit.canonical());
                     }
                 });
             }
         }
-        ui.horizontal(|ui| {
-            ui.label("方向");
+        labeled_row(ui, "方向", |ui| {
             for (value, label) in [
                 (Orientation::Portrait, "纵向"),
                 (Orientation::Landscape, "横向"),
@@ -845,7 +868,7 @@ impl App {
         });
 
         widgets::section_title(ui, "缩放模式");
-        ui.horizontal(|ui| {
+        labeled_row(ui, "模式", |ui| {
             egui::ComboBox::from_id_salt("pagesize-mode")
                 .width(180.0)
                 .selected_text(self.pagesize.scale_mode.label())
@@ -856,8 +879,7 @@ impl App {
                 });
         });
         if self.pagesize.scale_mode == ScaleMode::Percent {
-            ui.horizontal(|ui| {
-                ui.label("百分比");
+            labeled_row(ui, "百分比", |ui| {
                 ui.add(
                     egui::DragValue::new(&mut self.pagesize.percent)
                         .speed(1.0)
@@ -868,7 +890,7 @@ impl App {
         }
 
         widgets::section_title(ui, "旋转");
-        ui.horizontal_wrapped(|ui| {
+        labeled_row(ui, "旋转", |ui| {
             ui.selectable_value(&mut self.pagesize.rotation, Rotation::Keep, "保持");
             for deg in [0_i64, 90, 180, 270] {
                 ui.selectable_value(&mut self.pagesize.rotation, Rotation::Set(deg), format!("{deg}°"));
@@ -890,12 +912,10 @@ impl App {
                 .color(t.text_muted),
         );
         ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.label("PPI");
+        labeled_row(ui, "PPI", |ui| {
             ui.add(egui::DragValue::new(&mut self.pagesize.ppi).speed(1.0).range(1.0..=2400.0));
         });
-        ui.horizontal(|ui| {
-            ui.label("检测严格度");
+        labeled_row(ui, "检测严格度", |ui| {
             ui.selectable_value(&mut self.pagesize.strictness, Strictness::Strict, "严格");
             ui.selectable_value(&mut self.pagesize.strictness, Strictness::Lenient, "宽松");
         });
@@ -916,8 +936,7 @@ impl App {
                 .color(t.text_faint),
         );
         ui.add_space(4.0);
-        ui.horizontal_wrapped(|ui| {
-            ui.label("图像旋转");
+        labeled_row(ui, "图像旋转", |ui| {
             ui.selectable_value(&mut self.pagesize.image_rotation, ImageRotation::Auto, "自动");
             ui.selectable_value(&mut self.pagesize.image_rotation, ImageRotation::Keep, "保持");
             for deg in [0_i64, 90, 180, 270] {
@@ -1328,6 +1347,8 @@ impl App {
         }
     }
 
+    /// 输出选项：面板内始终渲染全部选项（当前输出方式用不到的置灰或换成说明），
+    /// 三种输出方式的面板高度因此完全一致，切换时分隔线不会跳动。
     fn output_options(&mut self, ui: &mut egui::Ui, t: Tokens) {
         widgets::section_title(ui, "输出");
         ui.horizontal(|ui| {
@@ -1336,113 +1357,160 @@ impl App {
             ui.selectable_value(&mut self.common.output, OutputChoice::InPlace, "覆盖原文件");
         });
         ui.add_space(2.0);
-        match self.common.output {
-            OutputChoice::SameFolder => {
-                ui.label(
-                    egui::RichText::new("另存到原文件所在目录，不改动原文件")
-                        .font(regular(11.5))
-                        .color(t.text_muted),
-                );
-            }
-            OutputChoice::Dir => {
-                let dir_text = self
-                    .common
-                    .dir
-                    .as_ref()
-                    .map(|dir| dir.display().to_string())
-                    .unwrap_or_else(|| "未选择".to_string());
-                let chosen = self.common.dir.is_some();
-                let mut ask = false;
-                ui.horizontal(|ui| {
-                    if widgets::pill_button(ui, "选择目录", false).clicked() {
-                        ask = true;
-                    }
-                    let color = if chosen { t.text } else { t.text_faint };
-                    ui.label(egui::RichText::new(dir_text).font(regular(12.0)).color(color));
-                });
-                if ask {
-                    self.ask_output_dir(ui.ctx());
-                }
-            }
-            OutputChoice::InPlace => {
-                ui.label(egui::RichText::new("会覆盖原文件（先写临时文件，再原子替换）").font(regular(11.5)).color(t.text_muted));
-            }
-        }
-        // 命名只在会写出新文件名时才有意义（覆盖原文件不改名）。
-        if self.common.output != OutputChoice::InPlace {
-            self.naming_row(ui, t);
-        }
-        ui.add_space(4.0);
+
+        // 目录行始终存在：点「选择目录」会自动切到「指定目录」；其余方式下显示该方式的说明。
+        let is_dir = self.common.output == OutputChoice::Dir;
+        let chosen = self.common.dir.is_some();
+        let dir_text = self
+            .common
+            .dir
+            .as_ref()
+            .map(|dir| dir.display().to_string())
+            .unwrap_or_else(|| "未选择".to_string());
+        let mut ask = false;
+        // 「选择目录」只在「指定目录」模式下可用；其余方式置灰并说明原因。
         ui.horizontal(|ui| {
-            ui.label("密码");
+            let button = ui
+                .add_enabled_ui(is_dir, |ui| widgets::pill_button(ui, "选择目录", false))
+                .inner;
+            if button.clicked() {
+                ask = true;
+            }
+            if !is_dir {
+                button.on_hover_text("只在「指定目录」模式下可用：请先切到「指定目录」");
+            }
+            let (text, color) = if is_dir {
+                (dir_text, if chosen { t.text } else { t.text_faint })
+            } else {
+                let hint = match self.common.output {
+                    OutputChoice::SameFolder => "另存到原文件所在目录，不改动原文件",
+                    OutputChoice::InPlace => "会覆盖原文件（先写临时文件，再原子替换）",
+                    OutputChoice::Dir => "",
+                };
+                (hint.to_string(), t.text_muted)
+            };
+            ui.add(
+                egui::Label::new(egui::RichText::new(text).font(regular(11.5)).color(color)).truncate(),
+            );
+        });
+        if ask {
+            self.ask_output_dir(ui.ctx());
+        }
+
+        self.naming_row(ui, t);
+
+        // 密码、整体重写、处理日志、失败即停：四项互不相关，各自占一行。
+        labeled_row(ui, "密码", |ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut self.common.password)
                     .password(true)
                     .hint_text("加密 PDF 才需要")
                     .desired_width(150.0),
             );
-            ui.checkbox(&mut self.common.full_save, "整体重写（更小，可能使签名失效）");
         });
-        // 处理日志与失败处理：三种模式共用。
+        ui.checkbox(&mut self.common.full_save, "整体重写（更小，可能使签名失效）");
+        // 勾选框在前（与上一行的「整体重写」、下一行的「失败即停」同风格）；
+        // 格式下拉始终留在行内（未勾选时置灰），行高因此不随勾选变化。
         ui.horizontal(|ui| {
             let mut logging = self.common.log.is_some();
             if ui.checkbox(&mut logging, "输出处理日志").changed() {
                 self.common.log = logging.then_some(LogFormat::Csv);
             }
-            if let Some(format) = &mut self.common.log {
+            let mut format = self.common.log.unwrap_or(LogFormat::Csv);
+            ui.add_enabled_ui(self.common.log.is_some(), |ui| {
                 egui::ComboBox::from_id_salt("pdfbatch-log-format")
                     .width(80.0)
                     .selected_text(format.canonical())
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(format, LogFormat::Csv, "csv");
-                        ui.selectable_value(format, LogFormat::Json, "json");
+                        ui.selectable_value(&mut format, LogFormat::Csv, "csv");
+                        ui.selectable_value(&mut format, LogFormat::Json, "json");
                     });
+            });
+            if self.common.log.is_some() {
+                self.common.log = Some(format);
             }
-            ui.checkbox(&mut self.common.stop_on_error, "失败即停");
-        });
-        if self.common.log.is_some() {
             ui.label(
-                egui::RichText::new(format!("日志写到可执行文件同级目录：{}", log_dir_hint()))
+                egui::RichText::new("写到可执行文件同级目录")
                     .font(regular(11.0))
                     .color(t.text_faint),
             );
-        }
+        });
+        ui.checkbox(&mut self.common.stop_on_error, "失败即停");
+        // 日志目录提示始终占一行，避免勾选日志时高度跳变。
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(format!("日志目录：{}", log_dir_hint()))
+                    .font(regular(11.0))
+                    .color(t.text_faint),
+            )
+            .truncate(),
+        );
     }
 
-    /// 文件名前缀 / 后缀：同目录另存与指定目录共用，覆盖原文件时不显示。
+    /// 文件名前缀 / 后缀：始终渲染（覆盖原文件时置灰），保证输出面板高度恒定。
     fn naming_row(&mut self, ui: &mut egui::Ui, t: Tokens) {
-        ui.horizontal(|ui| {
-            ui.label("文件名前缀");
-            ui.add(egui::TextEdit::singleline(&mut self.common.prefix).desired_width(80.0).hint_text("如 new_"));
-            ui.add_space(6.0);
-            ui.label("后缀");
-            ui.add(egui::TextEdit::singleline(&mut self.common.suffix).desired_width(80.0).hint_text("如 _filled"));
+        let naming_enabled = self.common.output != OutputChoice::InPlace;
+        ui.add_enabled_ui(naming_enabled, |ui| {
+            // 前缀与后缀各自一行：两个独立输入，不并排。
+            let prefix_width = text_field_width(ui, &self.common.prefix, 80.0);
+            labeled_row(ui, "文件名前缀", |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.common.prefix)
+                        .desired_width(prefix_width)
+                        .hint_text("如 new_"),
+                );
+            });
+            let suffix_width = text_field_width(ui, &self.common.suffix, 80.0);
+            labeled_row(ui, "文件名后缀", |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.common.suffix)
+                        .desired_width(suffix_width)
+                        .hint_text("如 _filled"),
+                );
+            });
         });
 
-        let naming = job::effective_naming(self.mode, &self.common);
         let sample = self
             .files
             .items
             .first()
             .and_then(|item| item.input.path.file_stem().map(|stem| stem.to_string_lossy().into_owned()))
             .unwrap_or_else(|| "文件名".to_string());
-        ui.label(
-            egui::RichText::new(format!("预览：{}{}{}.pdf", naming.prefix, sample, naming.suffix))
-                .font(regular(11.5))
-                .color(t.text_muted),
-        );
-
-        let both_empty = self.common.prefix.is_empty() && self.common.suffix.trim().is_empty();
-        if both_empty && self.common.output == OutputChoice::SameFolder {
+        if naming_enabled {
+            let naming = job::effective_naming(self.mode, &self.common);
             ui.label(
-                egui::RichText::new(format!("前后缀都为空，将使用默认后缀 {}，避免覆盖原文件", self.mode.suffix()))
-                    .font(regular(11.0))
+                egui::RichText::new(format!("预览：{}{}{}.pdf", naming.prefix, sample, naming.suffix))
+                    .font(regular(11.5))
+                    .color(t.text_muted),
+            );
+        } else {
+            ui.label(
+                egui::RichText::new(format!("预览：{sample}.pdf"))
+                    .font(regular(11.5))
                     .color(t.text_faint),
             );
         }
-        if let Err(message) = job::validate_naming(&self.common.prefix, &self.common.suffix) {
-            ui.label(egui::RichText::new(message).font(regular(11.5)).color(danger()));
-        }
+
+        // 提示行始终占一行：覆盖原文件时说明不参与重命名，非法字符给红字，
+        // 其余情况给出空前后缀的保护说明。
+        let (message, color) = if !naming_enabled {
+            ("覆盖原文件，不参与重命名".to_string(), t.text_faint)
+        } else if let Err(error) = job::validate_naming(&self.common.prefix, &self.common.suffix) {
+            (error, danger())
+        } else {
+            let both_empty = self.common.prefix.is_empty() && self.common.suffix.trim().is_empty();
+            if both_empty && self.common.output == OutputChoice::SameFolder {
+                (
+                    format!("前后缀都为空，将使用默认后缀 {}，避免覆盖原文件", self.mode.suffix()),
+                    t.text_faint,
+                )
+            } else {
+                (String::new(), t.text_faint)
+            }
+        };
+        ui.add(
+            egui::Label::new(egui::RichText::new(message).font(regular(11.0)).color(color)).truncate(),
+        );
     }
 
     fn run_bar(&mut self, ui: &mut egui::Ui, t: Tokens) {
@@ -1517,14 +1585,14 @@ impl App {
                                 FillAction::Add => {
                                     (format!("将对 {file_count} 个文件执行「新增填充层」"), t.text_muted)
                                 }
-                                FillAction::Erase | FillAction::Modify => {
+                                FillAction::Edit => {
                                     if probe_ok {
                                         let total =
                                             self.probe_report.as_ref().map(|report| report.total).unwrap_or(0);
                                         (
                                             format!(
                                                 "将对 {file_count} 个文件执行「{}」，命中 {total} 个填充层",
-                                                self.fill.action.label()
+                                                self.fill.edit_mode.label()
                                             ),
                                             t.text_muted,
                                         )
@@ -1669,34 +1737,130 @@ fn blend_combo(ui: &mut egui::Ui, id: &str, value: &mut Blend) {
         });
 }
 
-/// 「宽 × 高」两格输入（按宽高匹配时用）。
-fn size_row(ui: &mut egui::Ui, size: &mut [f64; 2]) {
+/// 一行「标签 + 控件」：标签与控件都画在同一固定高度的矩形内并垂直居中，
+/// 因此同一行的文字基线一致；行内控件数量变化（例如勾选后才出现的下拉框）
+/// 也不会改变行高，面板高度因此稳定。
+fn labeled_row<R>(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let row_height = ui.spacing().interact_size.y;
+    let label_width = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), regular(13.0), egui::Color32::WHITE)
+        .size()
+        .x
+        .max(48.0);
+    ui.horizontal(|ui| {
+        ui.set_min_height(row_height);
+        ui.add_sized([label_width, row_height], egui::Label::new(label).selectable(false));
+        ui.scope(add).inner
+    })
+    .inner
+}
+
+/// 输入框宽度：随文本内容增长，但不少于 `min`（空内容时按下限显示提示文字）。
+fn text_field_width(ui: &egui::Ui, text: &str, min: f32) -> f32 {
+    let measured = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), regular(13.0), egui::Color32::WHITE)
+        .size()
+        .x;
+    (measured + 24.0).max(min)
+}
+
+/// 左侧参数面板的最小宽度：三个标签页里最宽的一行并排选项 + 面板自身开销。
+///
+/// 下限取三者最大值并全局统一，这样切换标签页时面板宽度不会被悄悄改动。
+fn params_min_width(ui: &egui::Ui) -> f32 {
+    let font = regular(13.0);
+    // 面板自身开销：垂直滚动条 + 内边距。
+    const CHROME: f32 = 26.0;
+    let width = |label: &str, options: &[&str]| widgets::row_width(ui, label, options, font.clone());
+    [
+        // 填充区域：查找条件的「填充区域」四档（通常是最宽的一行）。
+        width("填充区域", &["不限", "整页", "按宽高", "按起点+宽高"]),
+        width("", &["整页填充", "自定义矩形填充"]),
+        width("单位", &["pt", "mm", "cm", "in"]),
+        width("", &["删除", "修改"]),
+        width("", &["置于顶层", "置于底层"]),
+        // 页面尺寸：方式、目标尺寸来源、方向、旋转、图像旋转。
+        width("", &["按目标尺寸缩放", "扫描件适配"]),
+        width("", &["预设", "自定义"]),
+        width("方向", &["纵向", "横向", "跟随原页面"]),
+        width("", &["保持", "0°", "90°", "180°", "270°"]),
+        width("图像旋转", &["自动", "保持", "0°", "90°", "180°", "270°"]),
+        // 书签：顶部三个按钮。
+        width("", &["选择 .txt 文件", "填入示例", "清空"]),
+    ]
+    .into_iter()
+    .fold(0.0_f32, f32::max)
+        + CHROME
+}
+
+/// 「宽 × 高」两格输入（按宽高匹配时用）；数值按界面上的「尺寸单位」解释。
+fn size_row(ui: &mut egui::Ui, size: &mut [f64; 2], unit: Unit) {
     egui::Grid::new("fill-size").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-        ui.label("宽");
+        ui.label(format!("宽（{}）", unit.canonical()));
         ui.add(egui::DragValue::new(&mut size[0]).speed(1.0).range(0.0..=20000.0));
         ui.end_row();
-        ui.label("高");
+        ui.label(format!("高（{}）", unit.canonical()));
         ui.add(egui::DragValue::new(&mut size[1]).speed(1.0).range(0.0..=20000.0));
         ui.end_row();
     });
 }
 
-/// 「左下起点 + 宽高」四格输入（按完整矩形匹配/修改时用）。
-fn rect_rows(ui: &mut egui::Ui, id: &str, rect: &mut [f64; 4]) {
+/// 「左下起点 + 宽高」四格输入（按完整矩形匹配/修改时用）；数值按「尺寸单位」解释。
+fn rect_rows(ui: &mut egui::Ui, id: &str, rect: &mut [f64; 4], unit: Unit) {
     egui::Grid::new(id).num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-        ui.label("X（左）");
+        ui.label(format!("X（左，{}）", unit.canonical()));
         ui.add(egui::DragValue::new(&mut rect[0]).speed(1.0).range(0.0..=20000.0));
         ui.end_row();
-        ui.label("Y（下）");
+        ui.label(format!("Y（下，{}）", unit.canonical()));
         ui.add(egui::DragValue::new(&mut rect[1]).speed(1.0).range(0.0..=20000.0));
         ui.end_row();
-        ui.label("宽");
+        ui.label(format!("宽（{}）", unit.canonical()));
         ui.add(egui::DragValue::new(&mut rect[2]).speed(1.0).range(-20000.0..=20000.0));
         ui.end_row();
-        ui.label("高");
+        ui.label(format!("高（{}）", unit.canonical()));
         ui.add(egui::DragValue::new(&mut rect[3]).speed(1.0).range(-20000.0..=20000.0));
         ui.end_row();
     });
+}
+
+/// 尺寸单位选择行；返回是否发生了切换。
+///
+/// 切换后调用方必须调 `convert_units` 把已填的尺寸按物理量等值换算，
+/// 否则用户会看到「换成 mm 后矩形突然变了」。
+fn unit_row(ui: &mut egui::Ui, unit: &mut Unit) -> bool {
+    let mut changed = false;
+    labeled_row(ui, "单位", |ui| {
+        for value in [Unit::Pt, Unit::Mm, Unit::Cm, Unit::In] {
+            if ui.selectable_value(unit, value, value.canonical()).changed() {
+                changed = true;
+            }
+        }
+    });
+    changed
+}
+
+/// 切换单位：已填的尺寸与尺寸容差按物理量等值换算，实际矩形不受影响。
+fn convert_units(fill: &mut job::FillDraft, from: Unit) {
+    let to = fill.unit;
+    if from == to {
+        return;
+    }
+    let convert = |value: f64| to.from_pt(from.to_pt(value));
+    for value in fill.rect.iter_mut() {
+        *value = convert(*value);
+    }
+    for value in fill.match_size.iter_mut() {
+        *value = convert(*value);
+    }
+    for value in fill.match_rect_value.iter_mut() {
+        *value = convert(*value);
+    }
+    for value in fill.change_rect_value.iter_mut() {
+        *value = convert(*value);
+    }
+    fill.rect_tolerance = convert(fill.rect_tolerance);
 }
 
 /// 预览一段书签树（空段与警告一并显示）。
@@ -1722,11 +1886,6 @@ fn preview_tree(ui: &mut egui::Ui, entries: &[SpecEntry], depth: usize, t: Token
         });
         preview_tree(ui, &entry.children, depth + 1, t);
     }
-}
-
-/// 颜色的十六进制写法（直接取 sRGB 分量）。
-fn hex(color: egui::Color32) -> String {
-    format!("#{:02X}{:02X}{:02X}", color.r(), color.g(), color.b())
 }
 
 fn counts(statuses: &[FileStatus]) -> (usize, usize, usize) {

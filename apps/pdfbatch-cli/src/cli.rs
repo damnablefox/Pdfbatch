@@ -32,6 +32,8 @@ const VALUE_FLAGS: &[&str] = &[
     "match-blend",
     "match-layer",
     "tolerance",
+    "rect-tolerance",
+    "color-tolerance",
     "set-rect",
     "set-color",
     "set-opacity",
@@ -157,7 +159,8 @@ fn parse_scale(raw: &RawArgs) -> Result<ScaleSpec, String> {
     };
     let orientation = match raw.value("orientation") {
         Some(text) => Orientation::parse(text)?,
-        None => Orientation::Portrait,
+        // 默认跟随原页面：改尺寸时不会把横向页莫名转成纵向。
+        None => Orientation::Auto,
     };
     let mode = match raw.value("mode") {
         Some(text) => ScaleMode::parse(text)?,
@@ -201,7 +204,8 @@ fn parse_scan(raw: &RawArgs) -> Result<ScanSpec, String> {
     };
     let rotation = match raw.value("image-rotate") {
         Some(text) => ImageRotation::parse(text)?,
-        None => ImageRotation::Auto,
+        // 默认保持图像原方向，不擅自旋转。
+        None => ImageRotation::Keep,
     };
     Ok(ScanSpec {
         ppi,
@@ -306,7 +310,8 @@ fn parse_style(raw: &RawArgs) -> Result<FillStyle, String> {
     };
     let opacity = match raw.value("opacity") {
         Some(text) => parse_unit(text, "--opacity")?,
-        None => 0.2,
+        // 默认完全不透明（与界面一致）。
+        None => 1.0,
     };
     let blend = match raw.value("blend") {
         Some(text) => Blend::parse(text)?,
@@ -344,18 +349,18 @@ fn parse_matcher(raw: &RawArgs) -> Result<Matcher, String> {
         Some(text) => Some(Layer::parse(text)?),
         None => None,
     };
-    let tolerance = match raw.value("tolerance") {
-        Some(text) => {
-            let value: f64 = text
-                .trim()
-                .parse()
-                .map_err(|_| format!("--tolerance 的值 `{text}` 不是数字"))?;
-            if !value.is_finite() || value < 0.0 {
-                return Err("--tolerance 必须是非负有限数".to_string());
-            }
-            value
-        }
-        None => 0.0,
+    // `--tolerance` 是旧写法：同时设置两个容差；两个新开关各自覆盖自己那一份。
+    let legacy = match raw.value("tolerance") {
+        Some(text) => Some(parse_tolerance(text, "--tolerance")?),
+        None => None,
+    };
+    let rect_tolerance = match raw.value("rect-tolerance") {
+        Some(text) => parse_tolerance(text, "--rect-tolerance")?,
+        None => legacy.unwrap_or(0.0),
+    };
+    let color_tolerance = match raw.value("color-tolerance") {
+        Some(text) => parse_tolerance(text, "--color-tolerance")?,
+        None => legacy.unwrap_or(0.0),
     };
     Ok(Matcher {
         rect,
@@ -363,8 +368,21 @@ fn parse_matcher(raw: &RawArgs) -> Result<Matcher, String> {
         opacity,
         blend,
         layer,
-        tolerance,
+        rect_tolerance,
+        color_tolerance,
     })
+}
+
+/// 解析一个非负的容差数值（两个容差与旧的 `--tolerance` 共用）。
+fn parse_tolerance(text: &str, flag: &str) -> Result<f64, String> {
+    let value: f64 = text
+        .trim()
+        .parse()
+        .map_err(|_| format!("{flag} 的值 `{text}` 不是数字"))?;
+    if !value.is_finite() || value < 0.0 {
+        return Err(format!("{flag} 必须是非负有限数"));
+    }
+    Ok(value)
 }
 
 /// 区域的三种匹配粒度，三者互斥。
@@ -441,7 +459,7 @@ fn reject_add_flags(raw: &RawArgs, mode: &str) -> Result<(), String> {
 
 /// 新增模式下，匹配与修改开关没有意义，出现即报错。
 fn reject_match_flags(raw: &RawArgs, mode: &str) -> Result<(), String> {
-    const MATCH: [&str; 14] = [
+    const MATCH: [&str; 16] = [
         "match-full-page",
         "match-size",
         "match-rect",
@@ -450,6 +468,8 @@ fn reject_match_flags(raw: &RawArgs, mode: &str) -> Result<(), String> {
         "match-blend",
         "match-layer",
         "tolerance",
+        "rect-tolerance",
+        "color-tolerance",
         "set-full-page",
         "set-rect",
         "set-color",
@@ -654,7 +674,7 @@ fill 专用 —— 三种操作，默认「新增」：
   --rect x,y,宽,高    填充矩形（PDF 用户空间坐标，单位点，原点在页面左下角）
   --full-page         整页填充（默认，等价于用页面 CropBox）
   --color <颜色>      #RRGGBB / R,G,B（0–255）/ R,G,B（0.0–1.0），默认 #FFE08C
-  --opacity <0..1>    不透明度，默认 0.2
+  --opacity <0..1>    不透明度，默认 1（完全不透明）
   --blend <模式>      混合模式：{}（默认 Normal）
   --layer <层级>      top = 盖在原有内容之上（默认）；bottom = 垫在原有内容之下
   --replace           先摘掉本工具此前加在该页的填充层（用来批量改混合模式/层级）
@@ -673,7 +693,9 @@ fill 专用 —— 三种操作，默认「新增」：
   --match-opacity <0..1>    匹配不透明度
   --match-blend <模式>       匹配混合模式
   --match-layer <层级>       匹配层级（top / bottom）
-  --tolerance <数值>         数值比较容差，默认 0（精确相等）
+  --rect-tolerance <数值>    尺寸容差（点），默认 0（精确相等）
+  --color-tolerance <0..1>   颜色与不透明度容差（归一化），默认 0（精确相等）
+  --tolerance <数值>         同时设置上面两个容差（旧写法，兼容保留）
 
   修改目标（--modify 专用，至少给一个）：
   --set-rect x,y,宽,高    改成这个矩形
@@ -692,7 +714,7 @@ pagesize 专用 —— 两种方式，默认「按目标尺寸缩放」，加 --
   --size <纸张>       预设尺寸：A0–A6、Letter、Legal、Tabloid
   --width <宽> --height <高>   自定义尺寸（默认单位 mm，用 --unit 改）
   --unit <单位>       pt / mm / cm / in（默认 mm，仅配合 --width/--height）
-  --orientation <方向>  portrait 纵向（默认）/ landscape 横向 / auto 跟随原页面
+  --orientation <方向>  auto 跟随原页面（默认）/ portrait 纵向 / landscape 横向
   --mode <模式>       fit 适应页面（默认）/ fill 填充页面 / stretch 内容拉伸 /
                       percent 自定义比例 / resize 只改页面尺寸 /
                       fit-width 适应宽度 / fit-height 适应高度
@@ -705,7 +727,7 @@ pagesize 专用 —— 两种方式，默认「按目标尺寸缩放」，加 --
   --ppi <数值>        PPI，默认 300
   --strictness <档>   strict 严格（页面恰有一张图，默认）/ lenient 宽松（忽略小图・水印・背景）
   --merge-images      多张图时按「图像合集外框」适配（默认跳过多图页面）
-  --image-rotate <旋转>  auto 自动（默认）/ keep 保持 / 0 / 90 / 180 / 270
+  --image-rotate <旋转>  keep 保持（默认）/ auto 自动 / 0 / 90 / 180 / 270
 
 共用：
   --log <格式>        产出处理日志：csv 或 json；默认写到可执行文件同级目录
@@ -798,7 +820,7 @@ mod tests {
                 assert_eq!(style.layer, Layer::Top);
                 assert!(!replace);
                 assert_eq!(f.pages, "all");
-                assert!(style.opacity > 0.0 && style.opacity <= 1.0);
+                assert_eq!(style.opacity, 1.0, "默认完全不透明");
                 assert_eq!(
                     f.common.output,
                     OutputMode::SameFolder {
@@ -828,7 +850,30 @@ mod tests {
                     assert_eq!(m.opacity, Some(0.2));
                     assert_eq!(m.blend, Some(Blend::Multiply));
                     assert_eq!(m.layer, Some(Layer::Top));
-                    assert_eq!(m.tolerance, 0.01);
+                    // `--tolerance` 是旧写法：两个容差一起设置。
+                    assert_eq!(m.rect_tolerance, 0.01);
+                    assert_eq!(m.color_tolerance, 0.01);
+                }
+                other => panic!("应当是删除：{other:?}"),
+            },
+            _ => panic!("应当是 fill"),
+        }
+        // 两个容差可以各自设置。
+        match parse(&args(&[
+            "fill",
+            "D:/a.pdf",
+            "--erase",
+            "--rect-tolerance",
+            "0.5",
+            "--color-tolerance",
+            "0.02",
+        ]))
+        .unwrap()
+        {
+            Invocation::Fill(f) => match &f.op {
+                FillOp::Remove(m) => {
+                    assert_eq!(m.rect_tolerance, 0.5);
+                    assert_eq!(m.color_tolerance, 0.02);
                 }
                 other => panic!("应当是删除：{other:?}"),
             },

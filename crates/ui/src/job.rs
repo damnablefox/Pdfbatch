@@ -60,22 +60,38 @@ pub enum OutputChoice {
     InPlace,
 }
 
-/// 填充区域的三种操作：增、删、改。
+/// 填充区域的操作：新增，或对已有填充层做删改。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FillAction {
     Add,
-    Erase,
-    Modify,
+    Edit,
 }
 
 impl FillAction {
-    pub const ALL: [FillAction; 3] = [FillAction::Add, FillAction::Erase, FillAction::Modify];
+    pub const ALL: [FillAction; 2] = [FillAction::Add, FillAction::Edit];
 
     pub fn label(self) -> &'static str {
         match self {
             FillAction::Add => "新增",
-            FillAction::Erase => "删除",
-            FillAction::Modify => "修改",
+            FillAction::Edit => "删改",
+        }
+    }
+}
+
+/// 「删改」下再分：删除命中的层，或把命中的层改成新属性。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FillEditMode {
+    Erase,
+    Modify,
+}
+
+impl FillEditMode {
+    pub const ALL: [FillEditMode; 2] = [FillEditMode::Erase, FillEditMode::Modify];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            FillEditMode::Erase => "删除",
+            FillEditMode::Modify => "修改",
         }
     }
 }
@@ -133,26 +149,30 @@ impl ChangeRect {
 /// 填充区域模式的参数草稿。
 #[derive(Clone, Debug)]
 pub struct FillDraft {
-    /// 增 / 删 / 改。
+    /// 新增，或删改。
     pub action: FillAction,
+    /// `FillAction::Edit` 时用：删除还是修改。
+    pub edit_mode: FillEditMode,
 
     // —— 新增用：要盖上去的样式 ——
     pub whole_page: bool,
-    /// 用户空间矩形 `[x, y, 宽, 高]`（点，原点在页面左下角）。
+    /// 自定义矩形 `[x, y, 宽, 高]`，按 `unit` 解释（原点在页面左下角）。
     pub rect: [f64; 4],
     /// 颜色，按 sRGB 存储（取色控件与 PDF 的 `rg` 用的是同一套取值）。
     pub color: egui::Color32,
     pub opacity: f64,
     pub blend: Blend,
     pub layer: Layer,
-    /// 先摘掉本工具此前加的填充层再重画。
-    pub replace: bool,
+
+    // —— 所有尺寸输入共用的单位 ——
+    /// 矩形与尺寸容差的输入单位（内部一律换算成点再比较）。
+    pub unit: Unit,
 
     // —— 查找用：匹配条件 ——
     pub match_rect: MatchRect,
-    /// `MatchRect::Size` 时用到的宽高。
+    /// `MatchRect::Size` 时用到的宽高（按 `unit` 解释）。
     pub match_size: [f64; 2],
-    /// `MatchRect::Rect` 时用到的左下起点与宽高。
+    /// `MatchRect::Rect` 时用到的左下起点与宽高（按 `unit` 解释）。
     pub match_rect_value: [f64; 4],
     pub match_color_on: bool,
     pub match_color: egui::Color32,
@@ -162,8 +182,10 @@ pub struct FillDraft {
     pub match_blend: Blend,
     pub match_layer_on: bool,
     pub match_layer: Layer,
-    /// 数值比较容差（矩形、颜色、透明度都用它）。0 表示精确相等。
-    pub tolerance: f64,
+    /// 尺寸容差（按 `unit` 解释）；0 表示精确相等。
+    pub rect_tolerance: f64,
+    /// 颜色与不透明度容差（0–1，逐通道 ±）；0 表示精确相等。
+    pub color_tolerance: f64,
 
     // —— 修改用：更改要求（每项可单独开关） ——
     pub change_rect: ChangeRect,
@@ -183,38 +205,42 @@ pub struct FillDraft {
 
 impl Default for FillDraft {
     fn default() -> Self {
-        let default_rect = [72.0, 72.0, 400.0, 150.0];
+        // 自定义矩形默认按毫米给整数，界面回显不会出现 25.40 这类零碎数字。
+        let default_rect = [20.0, 20.0, 150.0, 50.0];
         let default_color = egui::Color32::from_rgb(255, 235, 140);
         Self {
             action: FillAction::Add,
+            edit_mode: FillEditMode::Erase,
 
             whole_page: true,
             rect: default_rect,
             color: default_color,
-            opacity: 0.2,
+            opacity: 1.0,
             blend: Blend::Normal,
             layer: Layer::Top,
-            replace: false,
+
+            unit: Unit::Mm,
 
             match_rect: MatchRect::Any,
-            match_size: [400.0, 150.0],
+            match_size: [150.0, 50.0],
             match_rect_value: default_rect,
             match_color_on: false,
             match_color: default_color,
             match_opacity_on: false,
-            match_opacity: 0.2,
+            match_opacity: 1.0,
             match_blend_on: false,
             match_blend: Blend::Normal,
             match_layer_on: false,
             match_layer: Layer::Top,
-            tolerance: 0.0,
+            rect_tolerance: 0.0,
+            color_tolerance: 0.0,
 
             change_rect: ChangeRect::Keep,
             change_rect_value: default_rect,
             change_color_on: false,
             change_color: default_color,
             change_opacity_on: false,
-            change_opacity: 0.2,
+            change_opacity: 1.0,
             change_blend_on: false,
             change_blend: Blend::Normal,
             change_layer_on: false,
@@ -234,27 +260,37 @@ fn srgb(color: egui::Color32) -> [f64; 3] {
     ]
 }
 
+/// 把草稿里按 `unit` 解释的尺寸换算成点。
+fn rect_pt(unit: Unit, rect: [f64; 4]) -> [f64; 4] {
+    rect.map(|value| unit.to_pt(value))
+}
+
 /// 由草稿里的匹配条件得到查找谓词。
 fn fill_matcher(fill: &FillDraft) -> Matcher {
+    let unit = fill.unit;
     Matcher {
         rect: match fill.match_rect {
             MatchRect::Any => None,
             MatchRect::FullPage => Some(RectMatch::FullPage),
-            MatchRect::Size => Some(RectMatch::Size(fill.match_size)),
-            MatchRect::Rect => Some(RectMatch::Rect(fill.match_rect_value)),
+            MatchRect::Size => {
+                Some(RectMatch::Size([unit.to_pt(fill.match_size[0]), unit.to_pt(fill.match_size[1])]))
+            }
+            MatchRect::Rect => Some(RectMatch::Rect(rect_pt(unit, fill.match_rect_value))),
         },
         color: fill.match_color_on.then(|| srgb(fill.match_color)),
         opacity: fill.match_opacity_on.then_some(fill.match_opacity),
         blend: fill.match_blend_on.then_some(fill.match_blend),
         layer: fill.match_layer_on.then_some(fill.match_layer),
-        tolerance: fill.tolerance,
+        rect_tolerance: unit.to_pt(fill.rect_tolerance),
+        color_tolerance: fill.color_tolerance,
     }
 }
 
 /// 由草稿里的更改要求得到改写内容；全为 `None` 时返回空（表示没勾任何项）。
 fn fill_change(fill: &FillDraft) -> FillChange {
     FillChange {
-        rect: (fill.change_rect == ChangeRect::Rect).then_some(fill.change_rect_value),
+        rect: (fill.change_rect == ChangeRect::Rect)
+            .then(|| rect_pt(fill.unit, fill.change_rect_value)),
         full_page: (fill.change_rect == ChangeRect::FullPage).then_some(true),
         color: fill.change_color_on.then(|| srgb(fill.change_color)),
         opacity: fill.change_opacity_on.then_some(fill.change_opacity),
@@ -264,9 +300,12 @@ fn fill_change(fill: &FillDraft) -> FillChange {
 }
 
 /// 匹配条件的指纹：条件一变，之前的查找结果就作废，需重新查找。
+///
+/// 单位也纳入指纹：同一个数值换单位后指向的物理尺寸不同，匹配结果也随之改变。
 pub fn matcher_fingerprint(fill: &FillDraft) -> String {
     format!(
-        "rect={:?} size={:?} rectv={:?} color={}:{:?} opacity={}:{} blend={}:{:?} layer={}:{:?} tol={} pages={}",
+        "unit={:?} rect={:?} size={:?} rectv={:?} color={}:{:?} opacity={}:{} blend={}:{:?} layer={}:{:?} rtol={} ctol={} pages={}",
+        fill.unit,
         fill.match_rect,
         fill.match_size,
         fill.match_rect_value,
@@ -278,7 +317,8 @@ pub fn matcher_fingerprint(fill: &FillDraft) -> String {
         fill.match_blend,
         fill.match_layer_on,
         fill.match_layer,
-        fill.tolerance,
+        fill.rect_tolerance,
+        fill.color_tolerance,
         fill.pages,
     )
 }
@@ -357,7 +397,8 @@ impl Default for PageSizeDraft {
             width: 210.0,
             height: 297.0,
             unit: Unit::Mm,
-            orientation: Orientation::Portrait,
+            // 默认跟随原页面：改尺寸时不会把横向页莫名转成纵向。
+            orientation: Orientation::Auto,
             scale_mode: ScaleMode::Fit,
             percent: 100.0,
             rotation: Rotation::Keep,
@@ -365,7 +406,8 @@ impl Default for PageSizeDraft {
             ppi: scan::DEFAULT_PPI,
             strictness: Strictness::Strict,
             merge: false,
-            image_rotation: ImageRotation::Auto,
+            // 默认保持图像原方向，不擅自旋转。
+            image_rotation: ImageRotation::Keep,
 
             pages: "all".to_string(),
         }
@@ -505,9 +547,8 @@ pub fn preflight(
                 }
                 validate_page_syntax(&fill.pages)?;
             }
-            FillAction::Erase => validate_page_syntax(&fill.pages)?,
-            FillAction::Modify => {
-                if fill_change(fill).is_empty() {
+            FillAction::Edit => {
+                if fill.edit_mode == FillEditMode::Modify && fill_change(fill).is_empty() {
                     return Err("修改模式至少要勾选一项要改的属性".to_string());
                 }
                 validate_page_syntax(&fill.pages)?;
@@ -606,7 +647,7 @@ pub fn build_request(
         Mode::Fill => {
             let op = match fill.action {
                 FillAction::Add => {
-                    let rect = if fill.whole_page { None } else { Some(fill.rect) };
+                    let rect = if fill.whole_page { None } else { Some(rect_pt(fill.unit, fill.rect)) };
                     FillOp::Add {
                         style: FillStyle {
                             rect,
@@ -615,13 +656,16 @@ pub fn build_request(
                             blend: fill.blend,
                             layer: fill.layer,
                         },
-                        replace: fill.replace,
+                        // 界面不再提供「先摘掉已有填充层」，一律按追加处理。
+                        replace: false,
                     }
                 }
-                FillAction::Erase => FillOp::Remove(fill_matcher(fill)),
-                FillAction::Modify => FillOp::Modify {
-                    matcher: fill_matcher(fill),
-                    change: fill_change(fill),
+                FillAction::Edit => match fill.edit_mode {
+                    FillEditMode::Erase => FillOp::Remove(fill_matcher(fill)),
+                    FillEditMode::Modify => FillOp::Modify {
+                        matcher: fill_matcher(fill),
+                        change: fill_change(fill),
+                    },
                 },
             };
             Action::Fill {
@@ -1382,7 +1426,8 @@ mod tests {
     #[test]
     fn erase_request_carries_the_match_conditions() {
         let fill = FillDraft {
-            action: FillAction::Erase,
+            action: FillAction::Edit,
+            edit_mode: FillEditMode::Erase,
             match_rect: MatchRect::FullPage,
             match_color_on: true,
             match_color: egui::Color32::from_rgb(255, 224, 140),
@@ -1410,7 +1455,8 @@ mod tests {
     #[test]
     fn modify_requires_at_least_one_change() {
         let empty = FillDraft {
-            action: FillAction::Modify,
+            action: FillAction::Edit,
+            edit_mode: FillEditMode::Modify,
             ..FillDraft::default()
         };
         let error = build_request(
@@ -1424,7 +1470,8 @@ mod tests {
         assert!(error.contains("勾选"), "{error}");
 
         let filled = FillDraft {
-            action: FillAction::Modify,
+            action: FillAction::Edit,
+            edit_mode: FillEditMode::Modify,
             change_color_on: true,
             change_color: egui::Color32::from_rgb(0, 255, 0),
             ..FillDraft::default()
@@ -1444,6 +1491,68 @@ mod tests {
                 assert_eq!(change.full_page, None);
             }
             other => panic!("应当是修改：{other:?}"),
+        }
+    }
+
+    #[test]
+    fn fill_rect_is_converted_from_the_chosen_unit() {
+        let fill = FillDraft {
+            whole_page: false,
+            unit: Unit::Mm,
+            rect: [20.0, 20.0, 150.0, 50.0],
+            ..FillDraft::default()
+        };
+        let request = build_request(
+            Mode::Fill,
+            &fill,
+            &BookmarkDraft::default(),
+            &CommonOptions::default(),
+            vec![input("D:/a.pdf")],
+        )
+        .unwrap();
+        match request.action {
+            Action::Fill { op: FillOp::Add { style, .. }, .. } => {
+                let rect = style.rect.expect("自定义矩形");
+                // 150 mm = 150 ÷ 25.4 × 72 pt ≈ 425.197 pt；50 mm ≈ 141.732 pt。
+                assert!((rect[2] - 425.1968).abs() < 0.01, "{rect:?}");
+                assert!((rect[3] - 141.7323).abs() < 0.01, "{rect:?}");
+            }
+            other => panic!("应当是新增：{other:?}"),
+        }
+    }
+
+    #[test]
+    fn size_tolerance_shares_the_chosen_unit() {
+        let fill = FillDraft {
+            action: FillAction::Edit,
+            edit_mode: FillEditMode::Erase,
+            match_rect: MatchRect::Size,
+            match_size: [150.0, 50.0],
+            rect_tolerance: 1.0,
+            unit: Unit::Mm,
+            ..FillDraft::default()
+        };
+        let request = build_request(
+            Mode::Fill,
+            &fill,
+            &BookmarkDraft::default(),
+            &CommonOptions::default(),
+            vec![input("D:/a.pdf")],
+        )
+        .unwrap();
+        match request.action {
+            Action::Fill { op: FillOp::Remove(m), .. } => {
+                match m.rect {
+                    Some(RectMatch::Size([w, h])) => {
+                        assert!((w - 425.1968).abs() < 0.01, "{w}");
+                        assert!((h - 141.7323).abs() < 0.01, "{h}");
+                    }
+                    other => panic!("应当是宽高匹配：{other:?}"),
+                }
+                // 1 mm 容差 ≈ 2.8346 点：容差与尺寸同单位，内部统一换算成点。
+                assert!((m.rect_tolerance - 2.8346).abs() < 0.001, "{}", m.rect_tolerance);
+            }
+            other => panic!("应当是删除：{other:?}"),
         }
     }
 }
