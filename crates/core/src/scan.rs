@@ -1,196 +1,162 @@
-//! 扫描件页面适配：让页面尺寸贴合页面上的图像。
+//! 扫描件页面适配：由图像像素与 PPI 决定**整个文件统一的页面宽度**。
 //!
-//! 思路：图像有像素尺寸（`/Width`、`/Height`），配合用户给的 PPI 就能算出它的
-//! **本征物理尺寸**（`像素 ÷ PPI × 72` 点）。页面尺寸改成这个尺寸，整页就"贴合"图像、
-//! 四周不留白；内容按同一个比例平移缩放过去。
+//! 2026-10-15 的重设计要点：
 //!
-//! 多张图时（已确认按**方案 A**）：取各图像**绘制区域的并集外框**作为整体边界，
-//! 按同一比例折算页面尺寸。**不做像素级合成**——不新建图像对象，图与图之间的空隙
-//! 会成为页面内部留白（但页面四周无留白）。
+//! - 彩色 / 灰度 / 位图三种图像**各给一个 PPI**（位图默认更高，避免把线稿放大糊掉）。
+//! - 改成两阶段：先扫描全文件，算出"让每一页的每张图像都不低于各自 PPI 所允许的最大
+//!   页面宽度"，再取**全局最小值**；最后对每一页应用「适应宽度」。
+//! - 由于"允许宽度"的定义就是"此时实际 PPI 恰好等于阈值"，取全局最小值后每一页的
+//!   实际 PPI **只可能不小于**设定值。
+//! - 图像旋转、检测严格度、多图合集外框都已删除（旋转参数整体删除；多图由本算法自然覆盖）。
 
 use pdfcraft_cos::{Dict, Document, Object, Stream};
 use pdfcraft_model::Page;
 
 use crate::content::page_contents;
 use crate::error::{BatchError, Result};
-use crate::transform::{self, Matrix};
+use crate::transform::Matrix;
 
-/// 默认 PPI。
-pub const DEFAULT_PPI: f64 = 300.0;
+/// 默认 PPI：彩色、灰度、位图。
+pub const DEFAULT_COLOR_PPI: f64 = 300.0;
+pub const DEFAULT_GRAY_PPI: f64 = 300.0;
+pub const DEFAULT_MONO_PPI: f64 = 600.0;
 
-/// 检测严格度。
+/// 图像类型：决定用哪个 PPI 阈值。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Strictness {
-    /// 严格：页面上必须恰好有一个图像对象。
-    Strict,
-    /// 宽松：忽略小图 / 水印 / 背景后，恰好有一个图像对象。
-    Lenient,
+pub enum ImageKind {
+    /// 彩色（`DeviceRGB` / `DeviceCMYK` / ICC 等）。
+    Color,
+    /// 灰度（`DeviceGray`）。
+    Gray,
+    /// 位图 / 图像蒙版（`/ImageMask true`，通常 1 位黑白）。
+    Mono,
 }
 
-impl Strictness {
-    pub fn parse(text: &str) -> std::result::Result<Self, String> {
-        match text.trim().to_ascii_lowercase().as_str() {
-            "strict" | "严格" => Ok(Strictness::Strict),
-            "lenient" | "loose" | "宽松" => Ok(Strictness::Lenient),
-            _ => Err(format!("未知检测严格度 `{text}`；可用：strict、lenient")),
-        }
-    }
-
-    pub fn canonical(self) -> &'static str {
+impl ImageKind {
+    pub fn label(self) -> &'static str {
         match self {
-            Strictness::Strict => "strict",
-            Strictness::Lenient => "lenient",
+            ImageKind::Color => "彩色图像",
+            ImageKind::Gray => "灰度图像",
+            ImageKind::Mono => "位图图像",
         }
     }
 }
 
-/// 图像旋转的处理方式。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ImageRotation {
-    /// 保持原样，不额外旋转。
-    Keep,
-    /// 自动：图像像素朝向与页面绘制朝向明显相反时转 90°。
-    Auto,
-    /// 指定角度（0/90/180/270）。
-    Set(i64),
-}
-
-impl ImageRotation {
-    pub fn parse(text: &str) -> std::result::Result<Self, String> {
-        let text = text.trim();
-        match text.to_ascii_lowercase().as_str() {
-            "keep" | "保持" => Ok(ImageRotation::Keep),
-            "auto" | "自动" => Ok(ImageRotation::Auto),
-            _ => {
-                let degrees: i64 = text.parse().map_err(|_| {
-                    format!("未知图像旋转 `{text}`；可用：auto、keep、0、90、180、270")
-                })?;
-                ImageRotation::from_degrees(degrees)
-            }
-        }
-    }
-
-    pub fn from_degrees(degrees: i64) -> std::result::Result<Self, String> {
-        let normalized = degrees.rem_euclid(360);
-        if normalized % 90 != 0 {
-            return Err(format!("旋转角度 `{degrees}` 必须是 90 的倍数"));
-        }
-        Ok(ImageRotation::Set(normalized))
-    }
-
-    pub fn canonical(self) -> String {
-        match self {
-            ImageRotation::Keep => "keep".to_string(),
-            ImageRotation::Auto => "auto".to_string(),
-            ImageRotation::Set(deg) => deg.to_string(),
-        }
-    }
-}
-
-/// 一次扫描件适配的参数。
+/// 扫描件适配的参数：三种图像各自的 PPI。
 #[derive(Clone, Copy, Debug)]
 pub struct ScanSpec {
-    pub ppi: f64,
-    pub strictness: Strictness,
-    /// 多张图时是否按「图像合集外框」适配（关闭则跳过多图页面）。
-    pub merge: bool,
-    pub rotation: ImageRotation,
-    /// 宽松模式的过滤阈值：图像宽、高都不得小于这个像素数。
-    pub min_pixels: u32,
-    /// 宽松模式的过滤阈值：绘制面积占页面面积的比例下限。
-    pub min_area_ratio: f64,
+    pub color_ppi: f64,
+    pub gray_ppi: f64,
+    pub mono_ppi: f64,
 }
 
 impl Default for ScanSpec {
     fn default() -> Self {
         Self {
-            ppi: DEFAULT_PPI,
-            strictness: Strictness::Strict,
-            merge: false,
-            rotation: ImageRotation::Auto,
-            min_pixels: 64,
-            min_area_ratio: 0.1,
+            color_ppi: DEFAULT_COLOR_PPI,
+            gray_ppi: DEFAULT_GRAY_PPI,
+            mono_ppi: DEFAULT_MONO_PPI,
         }
     }
 }
 
-/// 一页的适配结果。
-#[derive(Clone, Debug)]
-pub enum ScanOutcome {
-    /// 适配完成：新的页面尺寸（点）与用到的图像数量。
-    Done {
-        width: f64,
-        height: f64,
-        images: usize,
-    },
-    /// 跳过，附原因。
-    Skipped(String),
+impl ScanSpec {
+    pub fn threshold(&self, kind: ImageKind) -> f64 {
+        match kind {
+            ImageKind::Color => self.color_ppi,
+            ImageKind::Gray => self.gray_ppi,
+            ImageKind::Mono => self.mono_ppi,
+        }
+    }
+
+    /// 三个 PPI 都必须为正（用户要求：为 0 时报错）。
+    pub fn validate(&self) -> Result<()> {
+        for (name, value) in [
+            ("彩色图像 PPI", self.color_ppi),
+            ("灰度图像 PPI", self.gray_ppi),
+            ("位图图像 PPI", self.mono_ppi),
+        ] {
+            if !(value.is_finite() && value > 0.0) {
+                return Err(BatchError::Arg(format!("{name} 必须是正数，当前是 {value}")));
+            }
+        }
+        Ok(())
+    }
 }
 
-/// 对一页执行扫描件适配。
-pub fn apply_page(doc: &mut Document, page: &Page, spec: &ScanSpec) -> Result<ScanOutcome> {
-    if !(spec.ppi.is_finite() && spec.ppi > 0.0) {
-        return Err(BatchError::Arg(format!("PPI 必须是正数，当前是 {}", spec.ppi)));
+/// 全文件的探测结果。
+#[derive(Clone, Debug, Default)]
+pub struct Probe {
+    /// 全文件统一的页面宽度（点）。`None` 表示这个文件里没有可用的图像。
+    pub width: Option<f64>,
+    /// 有可用图像的页号（从 0 开始，文档顺序）。
+    pub pages_with_images: Vec<usize>,
+    /// 含内联图像的页号：内联图像无法可靠折算，这些页面会跳过。
+    pub pages_with_inline: Vec<usize>,
+}
+
+impl Probe {
+    /// 该页是否参与本次适配（有可用图像的页面才参与）。
+    pub fn covers(&self, index: usize) -> bool {
+        self.pages_with_images.contains(&index)
     }
+}
 
-    let found = find_images(doc, page)?;
-    if found.inline {
-        return Ok(ScanOutcome::Skipped("页面存在内联图像".to_string()));
+/// 扫描整个文件，得出统一的页面宽度。
+pub fn probe(doc: &mut Document, spec: &ScanSpec) -> Result<Probe> {
+    spec.validate()?;
+    let all = pdfcraft_model::pages(doc);
+    let mut out = Probe::default();
+    for (index, page) in all.iter().enumerate() {
+        let found = find_images(doc, page)?;
+        if found.inline {
+            out.pages_with_inline.push(index);
+            continue;
+        }
+        if found.images.is_empty() {
+            continue;
+        }
+        let (display_width, _) = page.display_size(doc);
+        if !(display_width > 0.0) {
+            continue;
+        }
+        let mut page_best: Option<f64> = None;
+        for image in &found.images {
+            let Some(allowed) = allowed_width(image, spec, display_width) else {
+                continue;
+            };
+            page_best = Some(page_best.map_or(allowed, |best| best.min(allowed)));
+        }
+        if let Some(page_best) = page_best {
+            out.pages_with_images.push(index);
+            out.width = Some(out.width.map_or(page_best, |best| best.min(page_best)));
+        }
     }
+    Ok(out)
+}
 
-    let crop = page.crop(doc);
-    let page_area = (crop[2] - crop[0]) * (crop[3] - crop[1]);
-    let kept: Vec<FoundImage> = found
-        .images
-        .into_iter()
-        .filter(|image| match spec.strictness {
-            Strictness::Strict => true,
-            Strictness::Lenient => !image.is_ignorable(spec, page_area),
-        })
-        .collect();
-
-    if kept.is_empty() {
-        return Ok(ScanOutcome::Skipped("页面无图像".to_string()));
+/// 一张图像允许的**最大页面宽度**（点）。
+///
+/// 记阈值为 `P`、像素为 `px`、它在页面用户空间的绘制尺寸为 `r`、等比缩放系数为 `s`，
+/// 则实际 PPI = `px / (r · s) · 72`。要求它不低于 `P`，就得到
+/// `s ≤ px · 72 / (P · r)`；宽度方向与高度方向各算一次取小者，
+/// 再乘上页面的显示宽度，就是这一页允许的最大宽度。
+fn allowed_width(image: &FoundImage, spec: &ScanSpec, display_width: f64) -> Option<f64> {
+    let threshold = spec.threshold(image.kind);
+    if !(threshold.is_finite() && threshold > 0.0) {
+        return None;
     }
-    if kept.len() > 1 && !spec.merge {
-        return Ok(ScanOutcome::Skipped("非单图像页面".to_string()));
+    let rect_width = image.rect[2] - image.rect[0];
+    let rect_height = image.rect[3] - image.rect[1];
+    if !(rect_width > 0.0 && rect_height > 0.0) {
+        return None;
     }
-
-    // 合集外框（单图时就是它自己的绘制区域）。
-    let bbox = union_rects(&kept).ok_or_else(|| BatchError::Arg("图像绘制区域异常".to_string()))?;
-    let (bbox_w, bbox_h) = (bbox[2] - bbox[0], bbox[3] - bbox[1]);
-    if !(bbox_w > 0.0 && bbox_h > 0.0) {
-        return Ok(ScanOutcome::Skipped("图像绘制区域为空".to_string()));
-    }
-
-    // 比例：图像本征物理尺寸 ÷ 它在页面上的绘制尺寸（各图应一致，取第一张）。
-    let first = &kept[0];
-    let kx = (f64::from(first.pixels.0) / spec.ppi * 72.0) / (first.rect[2] - first.rect[0]);
-    let ky = (f64::from(first.pixels.1) / spec.ppi * 72.0) / (first.rect[3] - first.rect[1]);
-    if !(kx.is_finite() && ky.is_finite()) || kx <= 0.0 || ky <= 0.0 {
-        return Ok(ScanOutcome::Skipped("图像比例异常".to_string()));
-    }
-
-    let width = bbox_w * kx;
-    let height = bbox_h * ky;
-
-    // 内容变换：把外框左下角移到原点、按比例缩放，再按需要旋转回正。
-    let degrees = resolve_rotation(spec.rotation, &kept);
-    let matrix = Matrix::translate(-bbox[0], -bbox[1])
-        .then(Matrix::scale(kx, ky))
-        .then(rotate_fit(degrees, width, height));
-    let user_size = if degrees % 180 == 0 {
-        (width, height)
-    } else {
-        (height, width)
-    };
-    transform::apply_transform(doc, page, matrix, user_size, true)?;
-
-    Ok(ScanOutcome::Done {
-        width: user_size.0,
-        height: user_size.1,
-        images: kept.len(),
-    })
+    let pixels_width = f64::from(image.pixels.0);
+    let pixels_height = f64::from(image.pixels.1);
+    let by_width = pixels_width * 72.0 / (threshold * rect_width);
+    let by_height = pixels_height * 72.0 / (threshold * rect_height);
+    let width = display_width * by_width.min(by_height);
+    (width.is_finite() && width > 0.0).then_some(width)
 }
 
 /// 页面上找到的一张图像。
@@ -200,20 +166,8 @@ struct FoundImage {
     pixels: (u32, u32),
     /// 在页面用户空间里的绘制区域 `[x0, y0, x1, y1]`。
     rect: [f64; 4],
-    /// 是否带 `/SMask`（只记录，不影响尺寸）。
-    #[allow(dead_code)]
-    smask: bool,
-}
-
-impl FoundImage {
-    /// 宽松模式下是否应当忽略（小图 / 水印 / 背景）。
-    fn is_ignorable(&self, spec: &ScanSpec, page_area: f64) -> bool {
-        if self.pixels.0 < spec.min_pixels || self.pixels.1 < spec.min_pixels {
-            return true;
-        }
-        let area = (self.rect[2] - self.rect[0]) * (self.rect[3] - self.rect[1]);
-        page_area > 0.0 && area / page_area < spec.min_area_ratio
-    }
+    /// 图像类型（决定用哪个 PPI）。
+    kind: ImageKind,
 }
 
 /// 页面上的图像检测结果。
@@ -277,7 +231,7 @@ fn walk_content(
                 continue;
             };
             match stream.dict.name(b"Subtype") {
-                Some(b"Image") => record_image(stream, current, out),
+                Some(b"Image") => record_image(doc, stream, current, out),
                 Some(b"Form") => {
                     let form_ctm = current.then(form_matrix(stream));
                     let sub = form_resources(doc, stream, resources);
@@ -291,8 +245,8 @@ fn walk_content(
     }
 }
 
-/// 记录一张图像：像素尺寸与它在当前 CTM 下的绘制区域。
-fn record_image(stream: &Stream, ctm: Matrix, out: &mut Found) {
+/// 记录一张图像：像素尺寸、类型与它在当前 CTM 下的绘制区域。
+fn record_image(doc: &Document, stream: &Stream, ctm: Matrix, out: &mut Found) {
     let width = stream.dict.get(b"Width").and_then(Object::as_f64).unwrap_or(0.0);
     let height = stream.dict.get(b"Height").and_then(Object::as_f64).unwrap_or(0.0);
     if !(width >= 1.0 && height >= 1.0) {
@@ -311,8 +265,25 @@ fn record_image(stream: &Stream, ctm: Matrix, out: &mut Found) {
     out.images.push(FoundImage {
         pixels: (width.round() as u32, height.round() as u32),
         rect: [x0, y0, x1, y1],
-        smask: stream.dict.contains(b"SMask"),
+        kind: kind_of(doc, stream),
     });
+}
+
+/// 判定图像类型：位图（图像蒙版）→ 灰度 → 彩色。
+fn kind_of(doc: &Document, stream: &Stream) -> ImageKind {
+    let is_mask = matches!(stream.dict.get(b"ImageMask"), Some(Object::Bool(true)));
+    if is_mask {
+        return ImageKind::Mono;
+    }
+    let color_space = stream
+        .dict
+        .get(b"ColorSpace")
+        .map(|object| doc.resolve(object))
+        .and_then(|object| object.as_name().map(<[u8]>::to_vec));
+    match color_space.as_deref() {
+        Some(b"DeviceGray") => ImageKind::Gray,
+        _ => ImageKind::Color,
+    }
 }
 
 /// 查页面 Resources 里的 XObject。
@@ -370,299 +341,188 @@ fn page_content_bytes(doc: &mut Document, page: &Page) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// 若干绘制区域的并集外框。
-fn union_rects(images: &[FoundImage]) -> Option<[f64; 4]> {
-    let first = images.first()?;
-    let mut out = first.rect;
-    for image in &images[1..] {
-        out[0] = out[0].min(image.rect[0]);
-        out[1] = out[1].min(image.rect[1]);
-        out[2] = out[2].max(image.rect[2]);
-        out[3] = out[3].max(image.rect[3]);
-    }
-    Some(out)
-}
-
-/// 决定实际要旋转的角度。
-///
-/// 「自动」只看**图像自身**：像素朝向与它的绘制区域朝向相反时才转 90°。
-/// 多张图的外框朝向可能和单张图不同（并排的几张图外框是横向的），
-/// 拿外框去判会把不该转的页面转掉，所以多图时不自动旋转。
-fn resolve_rotation(rotation: ImageRotation, images: &[FoundImage]) -> i64 {
-    match rotation {
-        ImageRotation::Keep => 0,
-        ImageRotation::Set(deg) => deg.rem_euclid(360),
-        ImageRotation::Auto => {
-            if images.len() != 1 {
-                return 0;
-            }
-            let image = &images[0];
-            let image_landscape = image.pixels.0 > image.pixels.1;
-            let rect_landscape = (image.rect[2] - image.rect[0]) > (image.rect[3] - image.rect[1]);
-            if image_landscape != rect_landscape {
-                90
-            } else {
-                0
-            }
-        }
-    }
-}
-
-/// 「旋转 + 平移回正」：把 `w×h` 的内容转 `degrees` 后仍落在第一象限。
-fn rotate_fit(degrees: i64, w: f64, h: f64) -> Matrix {
-    match degrees.rem_euclid(360) {
-        90 => Matrix([0.0, 1.0, -1.0, 0.0, 0.0, 0.0]).then(Matrix::translate(h, 0.0)),
-        180 => Matrix([-1.0, 0.0, 0.0, -1.0, 0.0, 0.0]).then(Matrix::translate(w, h)),
-        270 => Matrix([0.0, -1.0, 1.0, 0.0, 0.0, 0.0]).then(Matrix::translate(0.0, w)),
-        _ => Matrix::IDENTITY,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pdfcraft_cos::Object;
-    use pdfcraft_model::pages;
 
-    /// 一页内容：依次用 `w 0 0 h x y cm /ImN Do` 放若干张图。
-    ///
-    /// 每项为（像素宽, 像素高, 绘制宽, 绘制高, 绘制 x, 绘制 y）。
-    fn document_with_images(images: &[(i64, i64, f64, f64, f64, f64)]) -> Document {
+    /// 造一个页面：`draw` 是图像在页面上的绘制尺寸（点），`pixels` 是像素尺寸。
+    fn document(pages: &[(Vec<(u32, u32, ImageKindSpec)>, (f64, f64))]) -> Document {
         let mut doc = Document::new_empty();
         let pages_ref = doc.add(Dict::new());
-        let page = doc.add(Dict::new());
         let root = doc.root().expect("new_empty 有根节点");
         doc.update_dict(root, |d| {
             d.set(b"Type".to_vec(), Object::name("Catalog"));
             d.set(b"Pages".to_vec(), Object::Ref(pages_ref));
         })
         .unwrap();
-        doc.update_dict(pages_ref, |d| {
-            d.set(b"Type".to_vec(), Object::name("Pages"));
-            d.set(b"Kids".to_vec(), Object::Array(vec![Object::Ref(page)]));
-            d.set(b"Count".to_vec(), Object::Int(1));
-        })
-        .unwrap();
 
-        let mut xobjects = Dict::new();
-        let mut content = String::new();
-        for (index, (px_w, px_h, dw, dh, dx, dy)) in images.iter().enumerate() {
-            let mut image = Dict::new();
-            image.set(b"Type".to_vec(), Object::name("XObject"));
-            image.set(b"Subtype".to_vec(), Object::name("Image"));
-            image.set(b"Width".to_vec(), Object::Int(*px_w));
-            image.set(b"Height".to_vec(), Object::Int(*px_h));
-            let image_ref = doc.add(Object::Stream(Stream::from_raw(image, vec![0u8; 4])));
-            let name = format!("Im{index}");
-            xobjects.set(name.clone().into_bytes(), Object::Ref(image_ref));
-            content.push_str(&format!("q\n{dw} 0 0 {dh} {dx} {dy} cm\n/{name} Do\nQ\n"));
+        let mut kids = Vec::new();
+        for (images, (page_w, page_h)) in pages {
+            let page = doc.add(Dict::new());
+            let mut xobjects = Dict::new();
+            let mut content = String::new();
+            for (index, (pixels_w, pixels_h, spec)) in images.iter().enumerate() {
+                let mut dict = Dict::new();
+                dict.set(b"Type".to_vec(), Object::name("XObject"));
+                dict.set(b"Subtype".to_vec(), Object::name("Image"));
+                dict.set(b"Width".to_vec(), Object::Int(i64::from(*pixels_w)));
+                dict.set(b"Height".to_vec(), Object::Int(i64::from(*pixels_h)));
+                dict.set(b"BitsPerComponent".to_vec(), Object::Int(8));
+                match spec {
+                    ImageKindSpec::Color => {
+                        dict.set(b"ColorSpace".to_vec(), Object::name("DeviceRGB"));
+                    }
+                    ImageKindSpec::Gray => {
+                        dict.set(b"ColorSpace".to_vec(), Object::name("DeviceGray"));
+                    }
+                    ImageKindSpec::Mono => {
+                        dict.set(b"ImageMask".to_vec(), Object::Bool(true));
+                    }
+                }
+                let reference = doc.add(Object::Stream(Stream::from_raw(dict, Vec::new())));
+                xobjects.set(format!("Im{index}").into_bytes(), Object::Ref(reference));
+                // 图像绘制时占单位正方形，这里直接缩放成整页大小（绘制区域 = 页面）。
+                let sx = *page_w;
+                let sy = *page_h;
+                content.push_str(&format!("q {sx} 0 0 {sy} 0 0 cm /Im{index} Do Q\n"));
+            }
+            let mut resources = Dict::new();
+            resources.set(b"XObject".to_vec(), Object::Dict(xobjects));
+            let content_stream = doc.add(Object::Stream(Stream::from_raw(
+                Dict::new(),
+                content.into_bytes(),
+            )));
+            doc.update_dict(page, |d| {
+                d.set(b"Type".to_vec(), Object::name("Page"));
+                d.set(b"Parent".to_vec(), Object::Ref(pages_ref));
+                d.set(
+                    b"MediaBox".to_vec(),
+                    Object::Array(vec![
+                        Object::Int(0),
+                        Object::Int(0),
+                        Object::Real(*page_w),
+                        Object::Real(*page_h),
+                    ]),
+                );
+                d.set(b"Resources".to_vec(), Object::Dict(resources));
+                d.set(b"Contents".to_vec(), Object::Ref(content_stream));
+            })
+            .unwrap();
+            kids.push(Object::Ref(page));
         }
 
-        let content_ref = doc.add(Object::Stream(Stream::from_raw(Dict::new(), content.into_bytes())));
-        let mut resources = Dict::new();
-        resources.set(b"XObject".to_vec(), Object::Dict(xobjects));
-
-        doc.update_dict(page, |d| {
-            d.set(b"Type".to_vec(), Object::name("Page"));
-            d.set(b"Parent".to_vec(), Object::Ref(pages_ref));
-            d.set(
-                b"MediaBox".to_vec(),
-                Object::Array(vec![Object::Int(0), Object::Int(0), Object::Int(600), Object::Int(800)]),
-            );
-            d.set(b"Resources".to_vec(), Object::Dict(resources));
-            d.set(b"Contents".to_vec(), Object::Ref(content_ref));
+        doc.update_dict(pages_ref, |d| {
+            d.set(b"Type".to_vec(), Object::name("Pages"));
+            d.set(b"Kids".to_vec(), Object::Array(kids));
+            d.set(b"Count".to_vec(), Object::Int(pages.len() as i64));
         })
         .unwrap();
         doc
     }
 
-    /// 单图页面的便捷写法。
-    fn document_with_image(px_w: i64, px_h: i64, draw: (f64, f64, f64, f64)) -> Document {
-        document_with_images(&[(px_w, px_h, draw.0, draw.1, draw.2, draw.3)])
+    /// 测试里描述图像类型的简写。
+    #[derive(Clone, Copy)]
+    enum ImageKindSpec {
+        Color,
+        Gray,
+        Mono,
     }
 
-    fn the_page(doc: &Document) -> Page {
-        pages(doc)[0].clone()
-    }
-
+    /// 用户给的例子：三页分别 1576×2288 彩色、1464×2184 灰度、1559×2368 位图，
+    /// 结论应当是宽度 187.08 pt（66.0 mm）。
     #[test]
-    fn a_full_page_scan_gets_the_size_its_pixels_imply() {
-        // 300 PPI 下 2550×3300 像素 = 8.5×11 英寸 = 612×792 点。
-        let mut doc = document_with_image(2550, 3300, (2550.0, 3300.0, 0.0, 0.0));
-        let page = the_page(&doc);
-        let outcome = apply_page(&mut doc, &page, &ScanSpec::default()).unwrap();
-        match outcome {
-            ScanOutcome::Done { width, height, images } => {
-                assert_eq!(images, 1);
-                assert!((width - 612.0).abs() < 0.01, "{width}");
-                assert!((height - 792.0).abs() < 0.01, "{height}");
-            }
-            other => panic!("应当适配成功：{other:?}"),
-        }
-        let page = the_page(&doc);
-        assert_eq!(page.display_size(&doc), (612.0, 792.0));
-    }
-
-    #[test]
-    fn ppi_changes_the_resulting_size() {
-        // 同一张图，PPI 减半 → 物理尺寸翻倍。
-        let mut doc = document_with_image(2550, 3300, (2550.0, 3300.0, 0.0, 0.0));
-        let page = the_page(&doc);
-        let spec = ScanSpec { ppi: 150.0, ..ScanSpec::default() };
-        match apply_page(&mut doc, &page, &spec).unwrap() {
-            ScanOutcome::Done { width, height, .. } => {
-                assert!((width - 1224.0).abs() < 0.01, "{width}");
-                assert!((height - 1584.0).abs() < 0.01, "{height}");
-            }
-            other => panic!("应当适配成功：{other:?}"),
-        }
-    }
-
-    #[test]
-    fn an_offset_image_is_shrunk_onto_the_page() {
-        // 图像只占页面中间一小块：适配后页面贴合它，不再有留白。
-        let mut doc = document_with_image(300, 300, (300.0, 300.0, 100.0, 200.0));
-        let page = the_page(&doc);
-        match apply_page(&mut doc, &page, &ScanSpec::default()).unwrap() {
-            ScanOutcome::Done { width, height, .. } => {
-                // 300 像素 @300PPI = 72 点。
-                assert!((width - 72.0).abs() < 0.01, "{width}");
-                assert!((height - 72.0).abs() < 0.01, "{height}");
-            }
-            other => panic!("应当适配成功：{other:?}"),
-        }
-        let page = the_page(&doc);
-        assert_eq!(page.crop(&doc), [0.0, 0.0, 72.0, 72.0]);
-    }
-
-    #[test]
-    fn multiple_images_need_the_merge_switch() {
-        // 两张 300×300 的图并排：绘制区域 300×300 与 300×300（第二张在 x=300）。
-        let images = [
-            (300, 300, 300.0, 300.0, 0.0, 0.0),
-            (300, 300, 300.0, 300.0, 300.0, 0.0),
+    fn reproduces_the_reported_example() {
+        let doc_pages = [
+            (vec![(1576u32, 2288u32, ImageKindSpec::Color)], (378.24, 549.12)),
+            (vec![(1464, 2184, ImageKindSpec::Gray)], (351.36, 524.16)),
+            (vec![(1559, 2368, ImageKindSpec::Mono)], (187.08, 284.16)),
         ];
+        let mut doc = document(&doc_pages);
+        let width = probe(&mut doc, &ScanSpec::default()).unwrap().width.unwrap();
+        assert!((width - 187.08).abs() < 0.01, "全局宽度应当是位图那一页的允许宽度：{width}");
+    }
 
-        // 未开「按图像合集适配」：多图页面跳过。
-        let mut doc = document_with_images(&images);
-        let page = the_page(&doc);
-        match apply_page(&mut doc, &page, &ScanSpec::default()).unwrap() {
-            ScanOutcome::Skipped(why) => assert!(why.contains("非单图像"), "{why}"),
-            other => panic!("应当跳过：{other:?}"),
-        }
-
-        // 开了合集：按外框适配。外框 600×300，300px@300PPI = 72pt、绘制 300pt → k = 0.24。
-        let mut doc = document_with_images(&images);
-        let page = the_page(&doc);
-        let spec = ScanSpec { merge: true, ..ScanSpec::default() };
-        match apply_page(&mut doc, &page, &spec).unwrap() {
-            ScanOutcome::Done { width, height, images } => {
-                assert_eq!(images, 2);
-                assert!((width - 144.0).abs() < 0.01, "{width}");
-                assert!((height - 72.0).abs() < 0.01, "{height}");
-            }
-            other => panic!("应当适配成功：{other:?}"),
-        }
+    /// 位图的默认阈值（600）比彩色/灰度（300）更严：同样的图，允许宽度只有一半。
+    #[test]
+    fn mono_threshold_is_stricter_than_color() {
+        let pages = [(vec![(1200u32, 1200u32, ImageKindSpec::Mono)], (144.0, 144.0))];
+        let mut doc = document(&pages);
+        // 1200 像素铺在 144pt 上正好是 600 PPI，不能再放大。
+        let strict = probe(&mut doc, &ScanSpec::default()).unwrap().width.unwrap();
+        assert!((strict - 144.0).abs() < 0.01, "{strict}");
+        // 放宽到 300 后允许放大一倍宽度。
+        let spec = ScanSpec {
+            mono_ppi: 300.0,
+            ..ScanSpec::default()
+        };
+        let relaxed = probe(&mut doc, &spec).unwrap().width.unwrap();
+        assert!((relaxed - 288.0).abs() < 0.01, "{relaxed}");
     }
 
     #[test]
-    fn a_page_without_images_is_skipped() {
-        let mut doc = Document::new_empty();
-        let pages_ref = doc.add(Dict::new());
-        let page = doc.add(Dict::new());
-        let root = doc.root().unwrap();
-        doc.update_dict(root, |d| {
-            d.set(b"Type".to_vec(), Object::name("Catalog"));
-            d.set(b"Pages".to_vec(), Object::Ref(pages_ref));
-        })
-        .unwrap();
-        doc.update_dict(pages_ref, |d| {
-            d.set(b"Type".to_vec(), Object::name("Pages"));
-            d.set(b"Kids".to_vec(), Object::Array(vec![Object::Ref(page)]));
-            d.set(b"Count".to_vec(), Object::Int(1));
-        })
-        .unwrap();
-        doc.update_dict(page, |d| {
-            d.set(b"Type".to_vec(), Object::name("Page"));
-            d.set(b"Parent".to_vec(), Object::Ref(pages_ref));
-            d.set(
-                b"MediaBox".to_vec(),
-                Object::Array(vec![Object::Int(0), Object::Int(0), Object::Int(200), Object::Int(300)]),
-            );
-        })
-        .unwrap();
-        let page = the_page(&doc);
-        match apply_page(&mut doc, &page, &ScanSpec::default()).unwrap() {
-            ScanOutcome::Skipped(why) => assert!(why.contains("无图像"), "{why}"),
-            other => panic!("应当跳过：{other:?}"),
-        }
+    fn pixel_count_raises_the_allowed_width() {
+        // 同样的阈值下，像素翻倍 → 允许宽度也翻倍。
+        let pages = [(vec![(2400u32, 2400u32, ImageKindSpec::Mono)], (144.0, 144.0))];
+        let mut doc = document(&pages);
+        let width = probe(&mut doc, &ScanSpec::default()).unwrap().width.unwrap();
+        assert!((width - 288.0).abs() < 0.01, "{width}");
     }
 
     #[test]
-    fn an_inline_image_is_reported() {
-        let mut doc = document_with_image(300, 300, (300.0, 300.0, 0.0, 0.0));
-        let page = the_page(&doc);
-        // 往内容流里塞一段内联图像。
-        let content = doc.add(Object::Stream(Stream::from_raw(
-            Dict::new(),
-            b"BI /W 4 /H 4 /BPC 8 /CS /G ID\x00\x01\x02\x03 EI\n".to_vec(),
-        )));
-        let list = page_contents(&mut doc, &page).unwrap();
-        let mut list = list;
-        list.push(Object::Ref(content));
-        crate::content::set_page_contents(&mut doc, &page, list).unwrap();
-
-        let page = the_page(&doc);
-        match apply_page(&mut doc, &page, &ScanSpec::default()).unwrap() {
-            ScanOutcome::Skipped(why) => assert!(why.contains("内联"), "{why}"),
-            other => panic!("应当跳过：{other:?}"),
-        }
+    fn gray_uses_its_own_threshold() {
+        let pages = [(vec![(1200u32, 1200u32, ImageKindSpec::Gray)], (144.0, 144.0))];
+        let mut doc = document(&pages);
+        let mut spec = ScanSpec::default();
+        let default_width = probe(&mut doc, &spec).unwrap().width.unwrap();
+        assert!((default_width - 288.0).abs() < 0.01, "灰度默认 300：{default_width}");
+        spec.gray_ppi = 600.0;
+        let strict = probe(&mut doc, &spec).unwrap().width.unwrap();
+        assert!((strict - 144.0).abs() < 0.01, "灰度提到 600：{strict}");
     }
 
     #[test]
-    fn lenient_mode_ignores_small_images() {
-        // 一张小图（16×16，远低于阈值）在宽松模式下被忽略 → 页面无图像可适配。
-        let mut doc = document_with_image(16, 16, (16.0, 16.0, 0.0, 0.0));
-        let page = the_page(&doc);
-        let spec = ScanSpec { strictness: Strictness::Lenient, ..ScanSpec::default() };
-        match apply_page(&mut doc, &page, &spec).unwrap() {
-            ScanOutcome::Skipped(why) => assert!(why.contains("无图像"), "{why}"),
-            other => panic!("应当跳过：{other:?}"),
-        }
-        // 严格模式下它仍然算一张图。
-        let mut doc = document_with_image(16, 16, (16.0, 16.0, 0.0, 0.0));
-        let page = the_page(&doc);
-        assert!(matches!(
-            apply_page(&mut doc, &page, &ScanSpec::default()).unwrap(),
-            ScanOutcome::Done { .. }
-        ));
+    fn pages_without_images_are_reported() {
+        let pages = [
+            (vec![(600u32, 600u32, ImageKindSpec::Color)], (144.0, 144.0)),
+            (vec![], (200.0, 300.0)),
+        ];
+        let mut doc = document(&pages);
+        let found = probe(&mut doc, &ScanSpec::default()).unwrap();
+        assert_eq!(found.pages_with_images, vec![0]);
+        assert!(found.width.is_some());
     }
 
     #[test]
-    fn a_bad_ppi_is_rejected() {
-        let mut doc = document_with_image(300, 300, (300.0, 300.0, 0.0, 0.0));
-        let page = the_page(&doc);
-        let spec = ScanSpec { ppi: 0.0, ..ScanSpec::default() };
-        assert!(apply_page(&mut doc, &page, &spec).is_err());
+    fn a_file_without_images_has_no_width() {
+        let pages = [(vec![], (200.0, 300.0))];
+        let mut doc = document(&pages);
+        let found = probe(&mut doc, &ScanSpec::default()).unwrap();
+        assert!(found.width.is_none());
+        assert!(found.pages_with_images.is_empty());
     }
 
     #[test]
-    fn rotation_helpers_are_consistent() {
-        // 转 90° 后 100×50 的内容落在 [0,50]×[0,100]。
-        let m = rotate_fit(90, 100.0, 50.0);
-        let (x, y) = m.apply(0.0, 0.0);
-        assert!((x - 50.0).abs() < 1e-9 && y.abs() < 1e-9, "{x},{y}");
-        assert!(rotate_fit(0, 10.0, 10.0).is_identity());
+    fn zero_ppi_is_rejected() {
+        let mut doc = document(&[(vec![], (200.0, 300.0))]);
+        let spec = ScanSpec {
+            color_ppi: 0.0,
+            ..ScanSpec::default()
+        };
+        assert!(probe(&mut doc, &spec).is_err());
     }
 
+    /// 一张图像的两个方向都会约束：像素宽高比与绘制宽高比不一致时取更严的那个。
     #[test]
-    fn values_and_parsing() {
-        assert_eq!(Strictness::parse("宽松").unwrap(), Strictness::Lenient);
-        assert!(Strictness::parse("whatever").is_err());
-        assert_eq!(ImageRotation::parse("auto").unwrap(), ImageRotation::Auto);
-        assert_eq!(ImageRotation::from_degrees(450).unwrap(), ImageRotation::Set(90));
-        assert!(ImageRotation::parse("45").is_err());
-        assert!(union_rects(&[]).is_none());
+    fn the_stricter_axis_wins() {
+        // 1000×1000 像素画到 100×200 的区域：横向 720 PPI、纵向 360 PPI，
+        // 阈值 300 时纵向更严，允许的缩放系数 = 1000×72/(300×200) = 1.2。
+        let pages = [(vec![(1000u32, 1000u32, ImageKindSpec::Color)], (100.0, 200.0))];
+        let mut doc = document(&pages);
+        let spec = ScanSpec {
+            color_ppi: 300.0,
+            ..ScanSpec::default()
+        };
+        let width = probe(&mut doc, &spec).unwrap().width.unwrap();
+        assert!((width - 120.0).abs() < 0.01, "{width}");
     }
-
 }

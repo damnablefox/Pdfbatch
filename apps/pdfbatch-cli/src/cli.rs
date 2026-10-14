@@ -5,9 +5,9 @@ use std::path::PathBuf;
 
 use pdfbatch_core::batch::{Naming, OutputMode};
 use pdfbatch_core::color::parse_color;
-use pdfbatch_core::pagesize::{Orientation, Rotation, ScaleMode, ScaleSpec};
+use pdfbatch_core::pagesize::{Orientation, ScaleMode, ScaleSpec, Target};
 use pdfbatch_core::report::LogFormat;
-use pdfbatch_core::scan::{self, ImageRotation, ScanSpec, Strictness};
+use pdfbatch_core::scan::{self, ScanSpec};
 use pdfbatch_core::units::{self, Unit};
 use pdfbatch_core::{Blend, FillChange, FillOp, FillStyle, Layer, Matcher, PageSizeMethod, RectMatch};
 
@@ -47,10 +47,9 @@ const VALUE_FLAGS: &[&str] = &[
     "orientation",
     "mode",
     "percent",
-    "rotate",
-    "ppi",
-    "strictness",
-    "image-rotate",
+    "color-ppi",
+    "gray-ppi",
+    "mono-ppi",
     // 处理日志
     "log",
     "log-dir",
@@ -142,78 +141,103 @@ fn parse_pagesize(raw: RawArgs) -> Result<PageSize, String> {
 
 /// 缩放参数（默认方式）。
 fn parse_scale(raw: &RawArgs) -> Result<ScaleSpec, String> {
-    let size = match (raw.value("size"), raw.value("width"), raw.value("height")) {
-        (Some(_), _, _) if raw.value("width").is_some() || raw.value("height").is_some() => {
-            return Err("--size 与 --width/--height 不能同时使用".to_string())
+    let has_size = raw.value("size").is_some();
+    let has_width = raw.value("width").is_some();
+    let has_height = raw.value("height").is_some();
+    if has_size && (has_width || has_height) {
+        return Err("--size 与 --width/--height 不能同时使用".to_string());
+    }
+    if !has_size && !has_width && !has_height {
+        return Err("需要 --size <纸张>，或至少给 --width / --height 之一".to_string());
+    }
+
+    let target = if let Some(name) = raw.value("size") {
+        let (w, h) = units::preset(name)
+            .ok_or_else(|| format!("未知纸张尺寸 `{name}`；可用：{}", units::preset_names().join("、")))?;
+        let orientation = match raw.value("orientation") {
+            Some(text) => Orientation::parse(text)?,
+            // 默认跟随原页面：改尺寸时不会把横向页莫名转成纵向。
+            None => Orientation::Auto,
+        };
+        Target::paper(w, h, orientation)
+    } else {
+        // 缺的那一维按 0 处理，表示"这一维不约束"，此时只有单维模式可用。
+        let unit = match raw.value("unit") {
+            Some(text) => Unit::parse(text)?,
+            None => Unit::Mm,
+        };
+        let width = match raw.value("width") {
+            Some(text) => unit.to_pt(parse_number(text, "--width")?),
+            None => 0.0,
+        };
+        let height = match raw.value("height") {
+            Some(text) => unit.to_pt(parse_number(text, "--height")?),
+            None => 0.0,
+        };
+        if width == 0.0 && height == 0.0 {
+            return Err("--width 与 --height 不能同时为 0".to_string());
         }
-        (Some(name), _, _) => units::preset(name)
-            .ok_or_else(|| format!("未知纸张尺寸 `{name}`；可用：{}", units::preset_names().join("、")))?,
-        (None, Some(w), Some(h)) => {
-            let unit = match raw.value("unit") {
-                Some(text) => Unit::parse(text)?,
-                None => Unit::Mm,
-            };
-            (unit.to_pt(parse_number(w, "--width")?), unit.to_pt(parse_number(h, "--height")?))
-        }
-        _ => return Err("需要 --size <纸张> 或同时给 --width 与 --height".to_string()),
+        Target::custom(width, height)
     };
-    let orientation = match raw.value("orientation") {
-        Some(text) => Orientation::parse(text)?,
-        // 默认跟随原页面：改尺寸时不会把横向页莫名转成纵向。
-        None => Orientation::Auto,
+
+    // 缺省模式要跟着尺寸来源走：只给一维时只能选那一维对应的模式。
+    let default_mode = match target {
+        Target::Custom { width, .. } if width == 0.0 => ScaleMode::FitHeight,
+        Target::Custom { height, .. } if height == 0.0 => ScaleMode::FitWidth,
+        _ => ScaleMode::Fit,
     };
     let mode = match raw.value("mode") {
         Some(text) => ScaleMode::parse(text)?,
-        None => ScaleMode::Fit,
+        None => default_mode,
     };
+
+    // 与界面同一条规则：预设下不提供单维模式；自定义下单维为 0 时只能用对应的单维模式。
+    let allowed = match target {
+        Target::Paper { .. } => !mode.custom_only(),
+        Target::Custom { width, height } => {
+            (width > 0.0 || !mode.needs_width()) && (height > 0.0 || !mode.needs_height())
+        }
+    };
+    if !allowed {
+        return Err(format!(
+            "`--mode {}` 在当前尺寸设置下不可用（预设纸张下不提供单维模式；某一维为 0 时只能用对应的单维模式）",
+            mode.canonical()
+        ));
+    }
+
     let percent = match raw.value("percent") {
         Some(text) => parse_number(text, "--percent")?,
         None => 100.0,
     };
-    if mode == ScaleMode::Percent && percent <= 0.0 {
+    if mode == ScaleMode::CenterScaled && percent <= 0.0 {
         return Err("--percent 必须为正数".to_string());
     }
-    let rotation = match raw.value("rotate") {
-        Some(text) => Rotation::parse(text)?,
-        None => Rotation::Keep,
-    };
     Ok(ScaleSpec {
-        size,
-        orientation,
+        target,
         mode,
         percent,
-        rotation,
     })
 }
 
-/// 扫描件适配参数（`--scan`）。
+/// 扫描件适配参数（`--scan`）：三种图像各自的 PPI。
 fn parse_scan(raw: &RawArgs) -> Result<ScanSpec, String> {
-    let ppi = match raw.value("ppi") {
-        Some(text) => {
-            let value = parse_number(text, "--ppi")?;
-            if value <= 0.0 {
-                return Err("--ppi 必须为正数".to_string());
-            }
-            value
+    let value_of = |flag: &str, default: f64| -> Result<f64, String> {
+        let Some(text) = raw.value(flag) else {
+            return Ok(default);
+        };
+        let value = parse_number(text, &format!("--{flag}"))?;
+        if value <= 0.0 {
+            return Err(format!("`--{flag}` 必须为正数"));
         }
-        None => scan::DEFAULT_PPI,
+        Ok(value)
     };
-    let strictness = match raw.value("strictness") {
-        Some(text) => Strictness::parse(text)?,
-        None => Strictness::Strict,
+    let spec = ScanSpec {
+        color_ppi: value_of("color-ppi", scan::DEFAULT_COLOR_PPI)?,
+        gray_ppi: value_of("gray-ppi", scan::DEFAULT_GRAY_PPI)?,
+        mono_ppi: value_of("mono-ppi", scan::DEFAULT_MONO_PPI)?,
     };
-    let rotation = match raw.value("image-rotate") {
-        Some(text) => ImageRotation::parse(text)?,
-        // 默认保持图像原方向，不擅自旋转。
-        None => ImageRotation::Keep,
-    };
-    Ok(ScanSpec {
-        ppi,
-        strictness,
-        merge: raw.has("merge-images"),
-        rotation,
-        ..ScanSpec::default()
-    })
+    spec.validate().map_err(|error| error.to_string())?;
+    Ok(spec)
 }
 
 /// 扫描模式下，缩放专用开关没有意义。
@@ -229,7 +253,7 @@ fn reject_scale_flags(raw: &RawArgs) -> Result<(), String> {
 
 /// 缩放模式下，扫描专用开关没有意义。
 fn reject_scan_flags(raw: &RawArgs) -> Result<(), String> {
-    const SCAN: [&str; 4] = ["ppi", "strictness", "image-rotate", "merge-images"];
+    const SCAN: [&str; 3] = ["color-ppi", "gray-ppi", "mono-ppi"];
     for key in SCAN {
         if raw.has(key) || raw.value(key).is_some() {
             return Err(format!("`--{key}` 只在 --scan 模式下有效"));
@@ -712,22 +736,24 @@ pagesize 专用 —— 两种方式，默认「按目标尺寸缩放」，加 --
 
   缩放（改页面尺寸，内容按所选模式缩放）：
   --size <纸张>       预设尺寸：A0–A6、Letter、Legal、Tabloid
+  --orientation <纸张方向>  auto 跟随原页面（默认）/ portrait 纵向 / landscape 横向（仅预设）
   --width <宽> --height <高>   自定义尺寸（默认单位 mm，用 --unit 改）
   --unit <单位>       pt / mm / cm / in（默认 mm，仅配合 --width/--height）
-  --orientation <方向>  auto 跟随原页面（默认）/ portrait 纵向 / landscape 横向
-  --mode <模式>       fit 适应页面（默认）/ fill 填充页面 / stretch 内容拉伸 /
-                      percent 自定义比例 / resize 只改页面尺寸 /
-                      fit-width 适应宽度 / fit-height 适应高度
-  --percent <百分比>  配合 --mode percent，如 150
-  --rotate <旋转>     keep 保持原 /Rotate（默认）/ 0 / 90 / 180 / 270
-                      选 0 就是「把 /Rotate 归零并并入内容变换」
+  --mode <模式>       fit-width 适应宽度 / fit-height 适应高度 /
+                      fit 适应页面（默认）/ fill 填充页面 / stretch 内容拉伸 /
+                      center 内容居中 / center-scaled 内容居中自定义缩放
+  --percent <百分比>  配合 --mode center-scaled，如 150
 
-  扫描件适配（页面尺寸贴合页面上的图像，四周不留白）：
+  说明：
+    适应宽度 / 适应高度会改写输出页面的另一维（不裁切不留白），只在自定义尺寸下可用；
+    自定义尺寸下某一维留空或填 0 表示「这一维不约束」，此时只能用对应的单维模式。
+    输出一律把 /Rotate 归零，并把原有旋转烘焙进内容变换。
+
+  扫描件适配（按图像像素与 PPI 求全文件统一的页面宽度，再逐页用「适应宽度」）：
   --scan              启用扫描件适配
-  --ppi <数值>        PPI，默认 300
-  --strictness <档>   strict 严格（页面恰有一张图，默认）/ lenient 宽松（忽略小图・水印・背景）
-  --merge-images      多张图时按「图像合集外框」适配（默认跳过多图页面）
-  --image-rotate <旋转>  keep 保持（默认）/ auto 自动 / 0 / 90 / 180 / 270
+  --color-ppi <数值>  彩色图像 PPI（默认 300）
+  --gray-ppi <数值>   灰度图像 PPI（默认 300）
+  --mono-ppi <数值>   位图（图像蒙版）PPI（默认 600）
 
 共用：
   --log <格式>        产出处理日志：csv 或 json；默认写到可执行文件同级目录
@@ -750,7 +776,8 @@ pagesize 专用 —— 两种方式，默认「按目标尺寸缩放」，加 --
   pdfbatch fill "D:\pdfs" --erase --match-color "255,224,140" --pages "all except first,last"
   pdfbatch fill "D:\pdfs" --modify --match-blend Multiply --set-opacity 0.5 --set-layer bottom
   pdfbatch pagesize "D:\a.pdf" --size A4 --mode fit --pages "all" --in-place
-  pdfbatch pagesize "D:\scans" --scan --ppi 300 --out-dir "D:\out" --log csv
+  pdfbatch pagesize "D:\a.pdf" --width 210 --height 0 --mode fit-width --out-dir "D:\out"
+  pdfbatch pagesize "D:\scans" --scan --mono-ppi 600 --out-dir "D:\out" --log csv
 "##,
         pdfbatch_core::blend::BLEND_NAMES.join("、")
     )
@@ -1024,10 +1051,19 @@ mod tests {
                 match p.method {
                     PageSizeMethod::Scale(spec) => {
                         assert_eq!(spec.mode, ScaleMode::Fill);
-                        assert_eq!(spec.orientation, Orientation::Landscape);
-                        // A4 纵向 210×297 mm ≈ 595.28×841.89 pt。
-                        assert!((spec.size.0 - 595.2756).abs() < 0.01, "{:?}", spec.size);
-                        assert!((spec.size.1 - 841.8898).abs() < 0.01, "{:?}", spec.size);
+                        match spec.target {
+                            Target::Paper {
+                                long_side,
+                                short_side,
+                                orientation,
+                            } => {
+                                assert_eq!(orientation, Orientation::Landscape);
+                                // A4 210×297 mm ≈ 595.28×841.89 pt。
+                                assert!((short_side - 595.2756).abs() < 0.01, "{short_side}");
+                                assert!((long_side - 841.8898).abs() < 0.01, "{long_side}");
+                            }
+                            other => panic!("应当是预设纸张：{other:?}"),
+                        }
                     }
                     other => panic!("应当是缩放：{other:?}"),
                 }
@@ -1045,11 +1081,14 @@ mod tests {
         .unwrap();
         match parsed {
             Invocation::PageSize(p) => match p.method {
-                PageSizeMethod::Scale(spec) => {
-                    // 100 mm ≈ 283.46 pt、200 mm ≈ 566.93 pt。
-                    assert!((spec.size.0 - 283.46).abs() < 0.1, "{:?}", spec.size);
-                    assert!((spec.size.1 - 566.93).abs() < 0.1, "{:?}", spec.size);
-                }
+                PageSizeMethod::Scale(spec) => match spec.target {
+                    Target::Custom { width, height } => {
+                        // 100 mm ≈ 283.46 pt、200 mm ≈ 566.93 pt。
+                        assert!((width - 283.46).abs() < 0.1, "{width}");
+                        assert!((height - 566.93).abs() < 0.1, "{height}");
+                    }
+                    other => panic!("应当是自定义尺寸：{other:?}"),
+                },
                 other => panic!("应当是缩放：{other:?}"),
             },
             _ => panic!("应当是 pagesize"),
@@ -1062,22 +1101,20 @@ mod tests {
             "pagesize",
             "D:/a.pdf",
             "--scan",
-            "--ppi",
-            "600",
-            "--strictness",
-            "lenient",
-            "--merge-images",
-            "--image-rotate",
-            "90",
+            "--color-ppi",
+            "200",
+            "--gray-ppi",
+            "400",
+            "--mono-ppi",
+            "800",
         ]))
         .unwrap();
         match parsed {
             Invocation::PageSize(p) => match p.method {
                 PageSizeMethod::Scan(spec) => {
-                    assert_eq!(spec.ppi, 600.0);
-                    assert_eq!(spec.strictness, Strictness::Lenient);
-                    assert!(spec.merge);
-                    assert_eq!(spec.rotation, ImageRotation::Set(90));
+                    assert_eq!(spec.color_ppi, 200.0);
+                    assert_eq!(spec.gray_ppi, 400.0);
+                    assert_eq!(spec.mono_ppi, 800.0);
                 }
                 other => panic!("应当是扫描：{other:?}"),
             },
@@ -1089,14 +1126,20 @@ mod tests {
     fn pagesize_rejects_mixed_or_missing_options() {
         // 两种方式互斥，各自的专属开关不能串用。
         assert!(parse(&args(&["pagesize", "D:/a.pdf", "--scan", "--size", "A4"])).is_err());
-        assert!(parse(&args(&["pagesize", "D:/a.pdf", "--ppi", "300"])).is_err());
-        assert!(parse(&args(&["pagesize", "D:/a.pdf", "--size", "A4", "--strictness", "strict"])).is_err());
+        assert!(parse(&args(&["pagesize", "D:/a.pdf", "--color-ppi", "300"])).is_err());
+        assert!(parse(&args(&["pagesize", "D:/a.pdf", "--size", "A4", "--gray-ppi", "300"])).is_err());
         // 缩放方式必须给出目标尺寸。
         assert!(parse(&args(&["pagesize", "D:/a.pdf", "--mode", "fit"])).is_err());
         // 预设名要认得出来。
         assert!(parse(&args(&["pagesize", "D:/a.pdf", "--size", "A7"])).is_err());
-        // 只给宽度不给高度也不行。
-        assert!(parse(&args(&["pagesize", "D:/a.pdf", "--width", "100"])).is_err());
+        // 只给宽度：另一维不约束，只能用「适应宽度」，默认模式也会跟着选它。
+        assert!(parse(&args(&["pagesize", "D:/a.pdf", "--width", "100"])).is_ok());
+        assert!(parse(&args(&["pagesize", "D:/a.pdf", "--width", "100", "--mode", "fit"])).is_err());
+        assert!(parse(&args(&["pagesize", "D:/a.pdf", "--width", "100", "--mode", "fit-width"])).is_ok());
+        // 宽高同时为 0 没有意义。
+        assert!(parse(&args(&["pagesize", "D:/a.pdf", "--width", "0", "--height", "0"])).is_err());
+        // 预设下不提供单维模式。
+        assert!(parse(&args(&["pagesize", "D:/a.pdf", "--size", "A4", "--mode", "fit-width"])).is_err());
     }
 
     #[test]

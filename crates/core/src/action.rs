@@ -11,7 +11,7 @@ use crate::batch::{self, Input, Job, OutputMode};
 use crate::error::{BatchError, Result};
 use crate::fill::{FillChange, FillStyle, Matcher};
 use crate::pagesize::{self, ScaleSpec};
-use crate::scan::{self, ScanOutcome, ScanSpec};
+use crate::scan::{self, ScanSpec};
 use crate::{bookmarks, fill, pages, pdf, spec};
 
 /// 书签文本的来源：所有文件共用一份，还是按文件分段。
@@ -208,6 +208,11 @@ impl Action {
                 let page_count = pdfcraft_organize::page_count(doc)?;
                 let targets = pages::parse_pages(range, page_count).map_err(BatchError::Arg)?;
                 let all = pdfcraft_model::pages(doc);
+                // 扫描件适配要先扫全文件：页面宽度是整个文件统一的，逐页各算会得到不同尺寸。
+                let scan = match method {
+                    PageSizeMethod::Scan(spec) => Some(scan::probe(doc, spec)?),
+                    PageSizeMethod::Scale(_) => None,
+                };
                 let mut records: Vec<PageRecord> = Vec::with_capacity(targets.len());
                 for &index in &targets {
                     let page = all
@@ -235,30 +240,51 @@ impl Action {
                                 size: None,
                             }),
                         },
-                        PageSizeMethod::Scan(spec) => match scan::apply_page(doc, &page, spec) {
-                            Ok(ScanOutcome::Done {
-                                width,
-                                height,
-                                images,
-                            }) => records.push(PageRecord {
-                                page: number,
-                                result: RecordResult::Done,
-                                reason: format!("贴合 {images} 张图像"),
-                                size: Some((width, height)),
-                            }),
-                            Ok(ScanOutcome::Skipped(why)) => records.push(PageRecord {
-                                page: number,
-                                result: RecordResult::Skipped,
-                                reason: why,
-                                size: None,
-                            }),
-                            Err(error) => records.push(PageRecord {
-                                page: number,
-                                result: RecordResult::Failed,
-                                reason: error.to_string(),
-                                size: None,
-                            }),
-                        },
+                        PageSizeMethod::Scan(_) => {
+                            let probe = scan.as_ref().expect("扫描件方法必然已探测");
+                            let Some(width) = probe.width else {
+                                records.push(PageRecord {
+                                    page: number,
+                                    result: RecordResult::Skipped,
+                                    reason: "文件内没有可用图像".to_string(),
+                                    size: None,
+                                });
+                                continue;
+                            };
+                            if !probe.covers(index) {
+                                let why = if probe.pages_with_inline.contains(&index) {
+                                    "页面含内联图像，无法折算"
+                                } else {
+                                    "页面无可用图像"
+                                };
+                                records.push(PageRecord {
+                                    page: number,
+                                    result: RecordResult::Skipped,
+                                    reason: why.to_string(),
+                                    size: None,
+                                });
+                                continue;
+                            }
+                            // 全文件统一宽度，用「适应宽度」应用（高度随内容）。
+                            let spec = ScaleSpec::new(
+                                crate::pagesize::Target::custom(width, 0.0),
+                                crate::pagesize::ScaleMode::FitWidth,
+                            );
+                            match pagesize::apply_page(doc, &page, &spec, true) {
+                                Ok((width, height)) => records.push(PageRecord {
+                                    page: number,
+                                    result: RecordResult::Done,
+                                    reason: format!("贴合图像，页宽 {}", round2(width)),
+                                    size: Some((width, height)),
+                                }),
+                                Err(error) => records.push(PageRecord {
+                                    page: number,
+                                    result: RecordResult::Failed,
+                                    reason: error.to_string(),
+                                    size: None,
+                                }),
+                            }
+                        }
                     }
                 }
                 let done = records.iter().filter(|r| r.result == RecordResult::Done).count();
@@ -588,13 +614,10 @@ mod tests {
     fn page_size_scale_reports_one_record_per_page() {
         let mut doc = two_page_document();
         let action = Action::PageSize {
-            method: PageSizeMethod::Scale(ScaleSpec {
-                size: (300.0, 400.0),
-                orientation: crate::pagesize::Orientation::Portrait,
-                mode: crate::pagesize::ScaleMode::Fit,
-                percent: 100.0,
-                rotation: crate::pagesize::Rotation::Keep,
-            }),
+            method: PageSizeMethod::Scale(ScaleSpec::new(
+                crate::pagesize::Target::custom(300.0, 400.0),
+                crate::pagesize::ScaleMode::Fit,
+            )),
             pages: "1".to_string(),
         };
         let note = action.run(&mut doc, Path::new("in-memory.pdf")).unwrap();

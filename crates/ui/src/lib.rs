@@ -18,9 +18,8 @@ use std::time::Duration;
 
 use eframe::egui;
 
-use pdfbatch_core::pagesize::{Orientation, Rotation, ScaleMode};
+use pdfbatch_core::pagesize::{Orientation, ScaleMode};
 use pdfbatch_core::report::LogFormat;
-use pdfbatch_core::scan::{ImageRotation, Strictness};
 use pdfbatch_core::spec::SpecEntry;
 use pdfbatch_core::units::Unit;
 use pdfbatch_core::{Blend, Layer};
@@ -778,6 +777,9 @@ impl App {
 
     /// 「页面尺寸」模式的参数：先选方式，再填各自参数，最后是作用范围。
     fn pagesize_params(&mut self, ui: &mut egui::Ui, t: Tokens) {
+        // 参数改动可能让当前模式不再可用（切到预设、或把某一维改成 0）：自动切到可用项，
+        // 具体原因由下面的 `mode_restriction` 常驻显示。
+        job::legalize(&mut self.pagesize);
         widgets::section_title(ui, "方式");
         ui.horizontal(|ui| {
             for method in SizeMethod::ALL {
@@ -820,22 +822,36 @@ impl App {
         });
         match self.pagesize.source {
             SizeSource::Preset => {
+                // 预设：纸张 → 纸张方向 → 纸张示意。
                 labeled_row(ui, "纸张", |ui| {
                     egui::ComboBox::from_id_salt("pagesize-preset")
-                        .width(160.0)
-                        .selected_text(self.pagesize.preset.clone())
+                        .width(210.0)
+                        .selected_text(paper_label(&self.pagesize.preset))
                         .show_ui(ui, |ui| {
                             for name in pdfbatch_core::units::preset_names() {
-                                ui.selectable_value(&mut self.pagesize.preset, name.to_string(), name);
+                                ui.selectable_value(
+                                    &mut self.pagesize.preset,
+                                    name.to_string(),
+                                    paper_label(name),
+                                );
                             }
                         });
                 });
+                labeled_row(ui, "纸张方向", |ui| {
+                    for (value, label) in [
+                        (Orientation::Portrait, "纵向"),
+                        (Orientation::Landscape, "横向"),
+                        (Orientation::Auto, "跟随原页面"),
+                    ] {
+                        ui.selectable_value(&mut self.pagesize.orientation, value, label);
+                    }
+                });
                 if let Some((w, h)) = pdfbatch_core::units::preset(&self.pagesize.preset) {
-                    // 毫米和点同时给：毫米方便与实物纸张对照，点便于核对 PDF 内部尺寸。
                     let mm = |pt: f64| pt / 72.0 * 25.4;
                     ui.label(
                         egui::RichText::new(format!(
-                            "{:.2} × {:.2} mm（{w:.2} × {h:.2} pt）",
+                            "{}（{:.2} × {:.2} mm）",
+                            self.pagesize.preset,
                             mm(w),
                             mm(h)
                         ))
@@ -845,41 +861,56 @@ impl App {
                 }
             }
             SizeSource::Custom => {
-                labeled_row(ui, "宽 × 高", |ui| {
-                    ui.add(egui::DragValue::new(&mut self.pagesize.width).speed(1.0).range(1.0..=20000.0));
-                    ui.label("×");
-                    ui.add(egui::DragValue::new(&mut self.pagesize.height).speed(1.0).range(1.0..=20000.0));
+                // 自定义：宽度、高度、页面单位分别一行；任一为 0 表示"这一维不约束"。
+                labeled_row(ui, "宽度", |ui| {
+                    ui.add(
+                        egui::DragValue::new(&mut self.pagesize.width)
+                            .speed(1.0)
+                            .range(0.0..=20000.0),
+                    );
                 });
-                labeled_row(ui, "单位", |ui| {
+                labeled_row(ui, "高度", |ui| {
+                    ui.add(
+                        egui::DragValue::new(&mut self.pagesize.height)
+                            .speed(1.0)
+                            .range(0.0..=20000.0),
+                    );
+                });
+                labeled_row(ui, "页面单位", |ui| {
                     for unit in [Unit::Pt, Unit::Mm, Unit::Cm, Unit::In] {
                         ui.selectable_value(&mut self.pagesize.unit, unit, unit.canonical());
                     }
                 });
             }
         }
-        labeled_row(ui, "方向", |ui| {
-            for (value, label) in [
-                (Orientation::Portrait, "纵向"),
-                (Orientation::Landscape, "横向"),
-                (Orientation::Auto, "跟随原页面"),
-            ] {
-                ui.selectable_value(&mut self.pagesize.orientation, value, label);
-            }
-        });
 
         widgets::section_title(ui, "缩放模式");
+        let allowed = job::allowed_modes(&self.pagesize);
         labeled_row(ui, "模式", |ui| {
             egui::ComboBox::from_id_salt("pagesize-mode")
-                .width(180.0)
+                .width(210.0)
                 .selected_text(self.pagesize.scale_mode.label())
                 .show_ui(ui, |ui| {
                     for mode in ScaleMode::ALL {
-                        ui.selectable_value(&mut self.pagesize.scale_mode, mode, mode.label());
+                        // 当前尺寸设置下不可用的模式置灰（原因写在下面一行）。
+                        let enabled = allowed.contains(&mode);
+                        if ui
+                            .add_enabled(
+                                enabled,
+                                egui::Button::selectable(
+                                    self.pagesize.scale_mode == mode,
+                                    mode.label(),
+                                ),
+                            )
+                            .clicked()
+                        {
+                            self.pagesize.scale_mode = mode;
+                        }
                     }
                 });
         });
-        if self.pagesize.scale_mode == ScaleMode::Percent {
-            labeled_row(ui, "百分比", |ui| {
+        if self.pagesize.scale_mode == ScaleMode::CenterScaled {
+            labeled_row(ui, "缩放比例", |ui| {
                 ui.add(
                     egui::DragValue::new(&mut self.pagesize.percent)
                         .speed(1.0)
@@ -888,65 +919,42 @@ impl App {
                 );
             });
         }
-
-        widgets::section_title(ui, "旋转");
-        labeled_row(ui, "旋转", |ui| {
-            ui.selectable_value(&mut self.pagesize.rotation, Rotation::Keep, "保持");
-            for deg in [0_i64, 90, 180, 270] {
-                ui.selectable_value(&mut self.pagesize.rotation, Rotation::Set(deg), format!("{deg}°"));
-            }
-        });
-        ui.label(
-            egui::RichText::new("选 0° 即把 /Rotate 归零、旋转并入内容变换")
-                .font(regular(11.0))
-                .color(t.text_faint),
-        );
+        // 把"哪些模式为什么点不了"直接写在界面上，别让人猜。
+        if let Some(why) = mode_restriction(&self.pagesize) {
+            ui.label(egui::RichText::new(why).font(regular(11.0)).color(t.text_faint));
+        }
     }
 
     /// 扫描件适配方式的参数。
     fn pagesize_scan(&mut self, ui: &mut egui::Ui, t: Tokens) {
         widgets::section_title(ui, "扫描件适配");
         ui.label(
-            egui::RichText::new("让页面尺寸贴合页面上的图像（像素 ÷ PPI × 72），四周不留白。")
-                .font(regular(11.0))
-                .color(t.text_muted),
-        );
-        ui.add_space(4.0);
-        labeled_row(ui, "PPI", |ui| {
-            ui.add(egui::DragValue::new(&mut self.pagesize.ppi).speed(1.0).range(1.0..=2400.0));
-        });
-        labeled_row(ui, "检测严格度", |ui| {
-            ui.selectable_value(&mut self.pagesize.strictness, Strictness::Strict, "严格");
-            ui.selectable_value(&mut self.pagesize.strictness, Strictness::Lenient, "宽松");
-        });
-        ui.label(
-            egui::RichText::new(if self.pagesize.strictness == Strictness::Strict {
-                "严格：页面恰有一张图像才处理。"
-            } else {
-                "宽松：忽略小图・水印・背景后，恰有一张图像才处理。"
-            })
+            egui::RichText::new(
+                "按图像像素与 PPI 算出整个文件统一的页面宽度，再对每一页应用「适应宽度」（高度随内容）。",
+            )
             .font(regular(11.0))
-            .color(t.text_faint),
+            .color(t.text_muted),
         );
         ui.add_space(4.0);
-        ui.checkbox(&mut self.pagesize.merge, "多张图时按「图像合集外框」适配");
+        for (label, value) in [
+            ("彩色图像 PPI", &mut self.pagesize.color_ppi),
+            ("灰度图像 PPI", &mut self.pagesize.gray_ppi),
+            ("位图图像 PPI", &mut self.pagesize.mono_ppi),
+        ] {
+            labeled_row(ui, label, |ui| {
+                ui.add(egui::DragValue::new(value).speed(1.0).range(1.0..=2400.0));
+            });
+        }
         ui.label(
-            egui::RichText::new("不做像素级拼合：图与图之间的空隙会变成页面内部留白。")
+            egui::RichText::new("位图（1 位黑白）默认给更高的 PPI，避免把线稿放大糊掉。")
                 .font(regular(11.0))
                 .color(t.text_faint),
         );
-        ui.add_space(4.0);
-        labeled_row(ui, "图像旋转", |ui| {
-            ui.selectable_value(&mut self.pagesize.image_rotation, ImageRotation::Auto, "自动");
-            ui.selectable_value(&mut self.pagesize.image_rotation, ImageRotation::Keep, "保持");
-            for deg in [0_i64, 90, 180, 270] {
-                ui.selectable_value(
-                    &mut self.pagesize.image_rotation,
-                    ImageRotation::Set(deg),
-                    format!("{deg}°"),
-                );
-            }
-        });
+        ui.label(
+            egui::RichText::new("各页宽度统一、高度随内容；实际 PPI 只会不小于设定值。")
+                .font(regular(11.0))
+                .color(t.text_faint),
+        );
     }
 
     fn bookmark_params(&mut self, ui: &mut egui::Ui, t: Tokens) {
@@ -1839,6 +1847,43 @@ fn unit_row(ui: &mut egui::Ui, unit: &mut Unit) -> bool {
         }
     });
     changed
+}
+
+/// 纸张下拉项的文本：名称 + 毫米尺寸（与"纸张示意"一致，方便直接对照实物）。
+fn paper_label(name: &str) -> String {
+    match pdfbatch_core::units::preset(name) {
+        Some((w, h)) => {
+            let mm = |pt: f64| pt / 72.0 * 25.4;
+            format!("{name}（{:.2} × {:.2} mm）", mm(w), mm(h))
+        }
+        None => name.to_string(),
+    }
+}
+
+/// 当前尺寸设置下模式受限的原因；没有受限时返回 `None`。
+///
+/// 这一行是给用户看的「为什么有些模式点不了」，与 `job::allowed_modes` 的规则一一对应。
+fn mode_restriction(draft: &PageSizeDraft) -> Option<String> {
+    match draft.source {
+        SizeSource::Preset => Some(
+            "预设纸张下不提供「适应宽度 / 适应高度」：它们会改写输出页面的另一维，输出将不等于所选的纸。需要「不裁不留白」时请改用自定义尺寸（例如宽度 210、高度 0、模式选适应宽度）。"
+                .to_string(),
+        ),
+        SizeSource::Custom => {
+            let no_width = !(draft.width > 0.0);
+            let no_height = !(draft.height > 0.0);
+            match (no_width, no_height) {
+                (false, false) => None,
+                (true, false) => {
+                    Some("宽度为 0：只有「适应高度」可用，输出宽度由内容决定。".to_string())
+                }
+                (false, true) => {
+                    Some("高度为 0：只有「适应宽度」可用，输出高度由内容决定。".to_string())
+                }
+                (true, true) => Some("宽度与高度不能同时为 0，请至少填写一个。".to_string()),
+            }
+        }
+    }
 }
 
 /// 切换单位：已填的尺寸与尺寸容差按物理量等值换算，实际矩形不受影响。
