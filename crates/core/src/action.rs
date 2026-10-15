@@ -96,8 +96,9 @@ pub enum Action {
 }
 
 /// 一页的处理结果。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RecordResult {
+    #[default]
     Done,
     Skipped,
     Failed,
@@ -114,7 +115,7 @@ impl RecordResult {
 }
 
 /// 一页的处理记录（目前由「页面尺寸」动作填写，供处理日志使用）。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PageRecord {
     /// 页码（从 1 开始）。
     pub page: usize,
@@ -123,6 +124,10 @@ pub struct PageRecord {
     pub reason: String,
     /// 处理后的页面尺寸（点），没有就是 `None`。
     pub size: Option<(f64, f64)>,
+    /// 扫描件适配：整个文件统一的页面宽度（点）。
+    pub scan_width: Option<f64>,
+    /// 处理之后该页所有图像的**最小实际 PPI**（按最终页面与绘制区域实测）。
+    pub min_ppi: Option<f64>,
 }
 
 /// 一次动作的结果说明：一句摘要，加上不致命的警告与逐页记录。
@@ -232,12 +237,14 @@ impl Action {
                                     round2(height)
                                 ),
                                 size: Some((width, height)),
+                                ..Default::default()
                             }),
                             Err(error) => records.push(PageRecord {
                                 page: number,
                                 result: RecordResult::Failed,
                                 reason: error.to_string(),
                                 size: None,
+                                ..Default::default()
                             }),
                         },
                         PageSizeMethod::Scan(_) => {
@@ -248,6 +255,7 @@ impl Action {
                                     result: RecordResult::Skipped,
                                     reason: "文件内没有可用图像".to_string(),
                                     size: None,
+                                    ..Default::default()
                                 });
                                 continue;
                             };
@@ -262,6 +270,7 @@ impl Action {
                                     result: RecordResult::Skipped,
                                     reason: why.to_string(),
                                     size: None,
+                                    ..Default::default()
                                 });
                                 continue;
                             }
@@ -271,17 +280,31 @@ impl Action {
                                 crate::pagesize::ScaleMode::FitWidth,
                             );
                             match pagesize::apply_page(doc, &page, &spec, true) {
-                                Ok((width, height)) => records.push(PageRecord {
-                                    page: number,
-                                    result: RecordResult::Done,
-                                    reason: format!("贴合图像，页宽 {}", round2(width)),
-                                    size: Some((width, height)),
-                                }),
+                                Ok((width, height)) => {
+                                    // 处理完之后实测该页所有图像的最小实际 PPI：写进日志便于自查，
+                                    // 也顺带把"全文件统一页宽"记下来。
+                                    let min_ppi = scan::measure_min_ppi(doc, &page).ok().flatten();
+                                    records.push(PageRecord {
+                                        page: number,
+                                        result: RecordResult::Done,
+                                        reason: match min_ppi {
+                                            Some(ppi) => format!(
+                                                "贴合图像，统一页宽 {}，最小实际 PPI {ppi:.2}",
+                                                round2(width)
+                                            ),
+                                            None => format!("贴合图像，统一页宽 {}", round2(width)),
+                                        },
+                                        size: Some((width, height)),
+                                        scan_width: Some(width),
+                                        min_ppi,
+                                    });
+                                }
                                 Err(error) => records.push(PageRecord {
                                     page: number,
                                     result: RecordResult::Failed,
                                     reason: error.to_string(),
                                     size: None,
+                                    ..Default::default()
                                 }),
                             }
                         }

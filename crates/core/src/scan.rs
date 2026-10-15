@@ -135,6 +135,33 @@ pub fn probe(doc: &mut Document, spec: &ScanSpec) -> Result<Probe> {
     Ok(out)
 }
 
+/// 允许宽度向下留的安全余量。
+///
+/// 内容流里的 `cm` 矩阵是按有限小数序列化的，缩放系数会有极小的舍入；
+/// 留一点余量才能保证**任何舍入方向下实际 PPI 都不低于**阈值——
+/// 设计上承诺的是"只允许大于，绝不允许小于"。
+const SAFETY_MARGIN: f64 = 1e-4;
+
+/// 处理完之后重新测量：该页所有图像的**最小实际 PPI**。
+///
+/// 变换层已经插在内容流里，所以这里枚举到的绘制长度就是缩放后的结果，
+/// 直接按 `像素 ÷ 绘制长度 × 72` 取每个方向的值，再取全页最小值。
+/// 这个值用于日志自查：它应当不低于对应类型的阈值。
+pub fn measure_min_ppi(doc: &mut Document, page: &Page) -> Result<Option<f64>> {
+    let found = find_images(doc, page)?;
+    let mut best: Option<f64> = None;
+    for image in &found.images {
+        if !(image.draw.0 > 0.0 && image.draw.1 > 0.0) {
+            continue;
+        }
+        let horizontal = image.pixels.0 * 72.0 / image.draw.0;
+        let vertical = image.pixels.1 * 72.0 / image.draw.1;
+        let ppi = horizontal.min(vertical);
+        best = Some(best.map_or(ppi, |value: f64| value.min(ppi)));
+    }
+    Ok(best)
+}
+
 /// 一张图像允许的**最大页面宽度**（点）。
 ///
 /// 记阈值为 `P`、像素为 `px`、它在页面用户空间的绘制尺寸为 `r`、等比缩放系数为 `s`，
@@ -146,26 +173,27 @@ fn allowed_width(image: &FoundImage, spec: &ScanSpec, display_width: f64) -> Opt
     if !(threshold.is_finite() && threshold > 0.0) {
         return None;
     }
-    let rect_width = image.rect[2] - image.rect[0];
-    let rect_height = image.rect[3] - image.rect[1];
-    if !(rect_width > 0.0 && rect_height > 0.0) {
+    let (draw_width, draw_height) = image.draw;
+    if !(draw_width > 0.0 && draw_height > 0.0) {
         return None;
     }
-    let pixels_width = f64::from(image.pixels.0);
-    let pixels_height = f64::from(image.pixels.1);
-    let by_width = pixels_width * 72.0 / (threshold * rect_width);
-    let by_height = pixels_height * 72.0 / (threshold * rect_height);
-    let width = display_width * by_width.min(by_height);
+    let by_width = image.pixels.0 * 72.0 / (threshold * draw_width);
+    let by_height = image.pixels.1 * 72.0 / (threshold * draw_height);
+    let width = display_width * by_width.min(by_height) * (1.0 - SAFETY_MARGIN);
     (width.is_finite() && width > 0.0).then_some(width)
 }
 
 /// 页面上找到的一张图像。
 #[derive(Clone, Copy, Debug)]
 struct FoundImage {
-    /// 像素尺寸 `(宽, 高)`。
-    pixels: (u32, u32),
-    /// 在页面用户空间里的绘制区域 `[x0, y0, x1, y1]`。
-    rect: [f64; 4],
+    /// 像素尺寸 `(宽, 高)`；保留小数（PDF 允许 `/Width` 是 Real）。
+    pixels: (f64, f64),
+    /// 图像**自身的两轴**在页面上的实际绘制长度（点）。
+    ///
+    /// 用 CTM 两个列向量的模长（宽轴 `√(a²+b²)`、高轴 `√(c²+d²)`），
+    /// 而不是绘制区域的包围盒：图像被旋转 90° 绘制时，像素宽那一边会落到
+    /// 包围盒的**高**上，按包围盒配对会把允许宽度算大、实际 PPI 掉到阈值以下。
+    draw: (f64, f64),
     /// 图像类型（决定用哪个 PPI）。
     kind: ImageKind,
 }
@@ -252,37 +280,63 @@ fn record_image(doc: &Document, stream: &Stream, ctm: Matrix, out: &mut Found) {
     if !(width >= 1.0 && height >= 1.0) {
         return;
     }
-    // 图像绘制时占单位正方形 [0,1]×[0,1]，四个角经 CTM 得到包围盒。
-    let corners = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)];
-    let points: Vec<(f64, f64)> = corners.iter().map(|(x, y)| ctm.apply(*x, *y)).collect();
-    let x0 = points.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
-    let x1 = points.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
-    let y0 = points.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
-    let y1 = points.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
-    if !(x1 > x0 && y1 > y0) {
+    // 图像绘制时占单位正方形：两条边经 CTM 后就是两个列向量，模长即实际绘制长度。
+    let [a, b, c, d, _, _] = ctm.0;
+    let draw = ((a * a + b * b).sqrt(), (c * c + d * d).sqrt());
+    if !(draw.0 > 0.0 && draw.1 > 0.0) {
         return;
     }
     out.images.push(FoundImage {
-        pixels: (width.round() as u32, height.round() as u32),
-        rect: [x0, y0, x1, y1],
+        pixels: (width, height),
+        draw,
         kind: kind_of(doc, stream),
     });
 }
 
-/// 判定图像类型：位图（图像蒙版）→ 灰度 → 彩色。
+/// 判定图像类型：位图（1 位黑白）→ 灰度 → 彩色。
+///
+/// **「位图」不只是 `/ImageMask`**：扫描仪输出的黑白件通常是
+/// `BitsPerComponent = 1` 的普通图像（`DeviceGray` 或 `Indexed` 两色），
+/// 它们同样只有黑白两值，必须按位图的 PPI 处理——否则那档更高的阈值永远不会生效。
 fn kind_of(doc: &Document, stream: &Stream) -> ImageKind {
-    let is_mask = matches!(stream.dict.get(b"ImageMask"), Some(Object::Bool(true)));
-    if is_mask {
+    if matches!(stream.dict.get(b"ImageMask"), Some(Object::Bool(true))) {
         return ImageKind::Mono;
     }
-    let color_space = stream
-        .dict
-        .get(b"ColorSpace")
-        .map(|object| doc.resolve(object))
-        .and_then(|object| object.as_name().map(<[u8]>::to_vec));
-    match color_space.as_deref() {
-        Some(b"DeviceGray") => ImageKind::Gray,
-        _ => ImageKind::Color,
+    // 每分量 1 位：只有黑白两值，按位图算。
+    if stream.dict.get(b"BitsPerComponent").and_then(Object::as_f64) == Some(1.0) {
+        return ImageKind::Mono;
+    }
+    if color_space_is_gray(doc, stream) {
+        return ImageKind::Gray;
+    }
+    ImageKind::Color
+}
+
+/// 色彩空间是否等价于灰度：`DeviceGray`，或 `/Indexed` 的基色空间是灰度。
+fn color_space_is_gray(doc: &Document, stream: &Stream) -> bool {
+    let Some(object) = stream.dict.get(b"ColorSpace") else {
+        return false;
+    };
+    let is_gray_name = |name: &[u8]| name == b"DeviceGray" || name == b"G";
+    match doc.resolve(object).as_ref() {
+        Object::Name(name) => is_gray_name(name),
+        Object::Array(items) => {
+            // [/Indexed 基色空间 hival lookup ...]：看基色空间是不是灰度。
+            let family = items
+                .first()
+                .map(|item| doc.resolve(item))
+                .and_then(|item| item.as_name().map(<[u8]>::to_vec));
+            match family.as_deref() {
+                Some(b"Indexed") | Some(b"I") => items
+                    .get(1)
+                    .map(|base| doc.resolve(base))
+                    .and_then(|base| base.as_name().map(<[u8]>::to_vec))
+                    .map(|name| is_gray_name(&name))
+                    .unwrap_or(false),
+                _ => false,
+            }
+        }
+        _ => false,
     }
 }
 
@@ -378,6 +432,10 @@ mod tests {
                     ImageKindSpec::Mono => {
                         dict.set(b"ImageMask".to_vec(), Object::Bool(true));
                     }
+                    ImageKindSpec::OneBitGray => {
+                        dict.set(b"ColorSpace".to_vec(), Object::name("DeviceGray"));
+                        dict.set(b"BitsPerComponent".to_vec(), Object::Int(1));
+                    }
                 }
                 let reference = doc.add(Object::Stream(Stream::from_raw(dict, Vec::new())));
                 xobjects.set(format!("Im{index}").into_bytes(), Object::Ref(reference));
@@ -426,6 +484,94 @@ mod tests {
         Color,
         Gray,
         Mono,
+        /// 1 位黑白、但不是 `/ImageMask`（扫描件最常见的形态）。
+        OneBitGray,
+    }
+
+    /// 一页 200×300，其中一张 1559×2368 的位图被**旋转 90°**绘制：
+    /// 图像自身的宽轴（1559 px 那一边）沿页面竖直方向、长 300pt，
+    /// 高轴（2368 px）沿水平方向、长 200pt。
+    fn rotated_document() -> Document {
+        let mut doc = Document::new_empty();
+        let pages_ref = doc.add(Dict::new());
+        let root = doc.root().expect("new_empty 有根节点");
+        doc.update_dict(root, |d| {
+            d.set(b"Type".to_vec(), Object::name("Catalog"));
+            d.set(b"Pages".to_vec(), Object::Ref(pages_ref));
+        })
+        .unwrap();
+
+        let page = doc.add(Dict::new());
+        let mut dict = Dict::new();
+        dict.set(b"Type".to_vec(), Object::name("XObject"));
+        dict.set(b"Subtype".to_vec(), Object::name("Image"));
+        dict.set(b"Width".to_vec(), Object::Int(1559));
+        dict.set(b"Height".to_vec(), Object::Int(2368));
+        dict.set(b"BitsPerComponent".to_vec(), Object::Int(1));
+        dict.set(b"ColorSpace".to_vec(), Object::name("DeviceGray"));
+        let image = doc.add(Object::Stream(Stream::from_raw(dict, Vec::new())));
+        let mut xobjects = Dict::new();
+        xobjects.set(b"Im0".to_vec(), Object::Ref(image));
+        let mut resources = Dict::new();
+        resources.set(b"XObject".to_vec(), Object::Dict(xobjects));
+        // `0 300 -200 0 200 0 cm`：图像 x 轴 → 页面 +y（长 300），y 轴 → 页面 -x（长 200）。
+        let content = doc.add(Object::Stream(Stream::from_raw(
+            Dict::new(),
+            b"q 0 300 -200 0 200 0 cm /Im0 Do Q\n".to_vec(),
+        )));
+        doc.update_dict(page, |d| {
+            d.set(b"Type".to_vec(), Object::name("Page"));
+            d.set(b"Parent".to_vec(), Object::Ref(pages_ref));
+            d.set(
+                b"MediaBox".to_vec(),
+                Object::Array(vec![Object::Int(0), Object::Int(0), Object::Int(200), Object::Int(300)]),
+            );
+            d.set(b"Resources".to_vec(), Object::Dict(resources));
+            d.set(b"Contents".to_vec(), Object::Ref(content));
+        })
+        .unwrap();
+        doc.update_dict(pages_ref, |d| {
+            d.set(b"Type".to_vec(), Object::name("Pages"));
+            d.set(b"Kids".to_vec(), Object::Array(vec![Object::Ref(page)]));
+            d.set(b"Count".to_vec(), Object::Int(1));
+        })
+        .unwrap();
+        doc
+    }
+
+    /// 旋转绘制的图像必须按「图像自身的轴」配对像素，不能按包围盒：
+    /// 否则允许宽度会算大，实际 PPI 掉到阈值以下。
+    #[test]
+    fn rotated_images_pair_the_right_axis() {
+        let mut doc = rotated_document();
+        let width = probe(&mut doc, &ScanSpec::default()).unwrap().width.unwrap();
+        // 宽轴 300pt：1559×72/(600×300) = 0.6236；高轴 200pt：2368×72/(600×200) = 1.4208。
+        // 取小者 0.6236，页面宽 200 → 允许 124.72，再乘 1e-4 的余量 → 124.7075。
+        assert!((width - 124.71).abs() < 0.05, "允许宽度应当是 124.71：{width}");
+    }
+
+    /// 端到端：按探测出的统一宽度处理完之后，实测的最小 PPI 必须不低于阈值。
+    #[test]
+    fn measured_ppi_after_apply_is_not_below_the_threshold() {
+        let pages = [
+            (vec![(3000u32, 3000u32, ImageKindSpec::Color)], (720.0, 720.0)),
+            (vec![(1200u32, 1200u32, ImageKindSpec::Mono)], (144.0, 144.0)),
+        ];
+        let mut doc = document(&pages);
+        let spec = ScanSpec::default();
+        let width = probe(&mut doc, &spec).unwrap().width.unwrap();
+
+        let scale = crate::pagesize::ScaleSpec::new(
+            crate::pagesize::Target::custom(width, 0.0),
+            crate::pagesize::ScaleMode::FitWidth,
+        );
+        // 彩色页要求 ≥300、位图页要求 ≥600；统一宽度由位图那一页决定。
+        for (index, threshold) in [(0usize, 300.0), (1usize, 600.0)] {
+            let page = pdfcraft_model::pages(&doc)[index].clone();
+            crate::pagesize::apply_page(&mut doc, &page, &scale, true).unwrap();
+            let ppi = measure_min_ppi(&mut doc, &page).unwrap().unwrap();
+            assert!(ppi >= threshold, "第 {} 页实测 {ppi} 应当不小于 {threshold}", index + 1);
+        }
     }
 
     /// 用户给的例子：三页分别 1576×2288 彩色、1464×2184 灰度、1559×2368 位图，
@@ -439,7 +585,7 @@ mod tests {
         ];
         let mut doc = document(&doc_pages);
         let width = probe(&mut doc, &ScanSpec::default()).unwrap().width.unwrap();
-        assert!((width - 187.08).abs() < 0.01, "全局宽度应当是位图那一页的允许宽度：{width}");
+        assert!((width - 187.08).abs() < 0.05, "全局宽度应当是位图那一页的允许宽度：{width}");
     }
 
     /// 位图的默认阈值（600）比彩色/灰度（300）更严：同样的图，允许宽度只有一半。
@@ -449,14 +595,14 @@ mod tests {
         let mut doc = document(&pages);
         // 1200 像素铺在 144pt 上正好是 600 PPI，不能再放大。
         let strict = probe(&mut doc, &ScanSpec::default()).unwrap().width.unwrap();
-        assert!((strict - 144.0).abs() < 0.01, "{strict}");
+        assert!((strict - 144.0).abs() < 0.05, "{strict}");
         // 放宽到 300 后允许放大一倍宽度。
         let spec = ScanSpec {
             mono_ppi: 300.0,
             ..ScanSpec::default()
         };
         let relaxed = probe(&mut doc, &spec).unwrap().width.unwrap();
-        assert!((relaxed - 288.0).abs() < 0.01, "{relaxed}");
+        assert!((relaxed - 288.0).abs() < 0.05, "{relaxed}");
     }
 
     #[test]
@@ -465,7 +611,27 @@ mod tests {
         let pages = [(vec![(2400u32, 2400u32, ImageKindSpec::Mono)], (144.0, 144.0))];
         let mut doc = document(&pages);
         let width = probe(&mut doc, &ScanSpec::default()).unwrap().width.unwrap();
-        assert!((width - 288.0).abs() < 0.01, "{width}");
+        assert!((width - 288.0).abs() < 0.05, "{width}");
+    }
+
+    /// 位图判定：1 位黑白即使不是 `/ImageMask`，也要按位图的高阈值处理。
+    #[test]
+    fn one_bit_images_use_the_mono_threshold() {
+        // 1200×1200 铺在 144pt：按位图阈值 600 只允许 144，按灰度阈值 300 会放到 288。
+        let pages = [(vec![(1200u32, 1200u32, ImageKindSpec::OneBitGray)], (144.0, 144.0))];
+        let mut doc = document(&pages);
+        let width = probe(&mut doc, &ScanSpec::default()).unwrap().width.unwrap();
+        assert!(width < 144.0 && width > 143.9, "1 位黑白应当走位图阈值：{width}");
+    }
+
+    /// 允许宽度会向下留安全余量：实际 PPI 不会因内容流数字的序列化舍入掉到阈值之下。
+    #[test]
+    fn allowed_width_keeps_a_safety_margin() {
+        let pages = [(vec![(1200u32, 1200u32, ImageKindSpec::Mono)], (144.0, 144.0))];
+        let mut doc = document(&pages);
+        let width = probe(&mut doc, &ScanSpec::default()).unwrap().width.unwrap();
+        let expected = 144.0 * (1.0 - SAFETY_MARGIN);
+        assert!((width - expected).abs() < 1e-6, "{width} 与 {expected}");
     }
 
     #[test]
@@ -474,10 +640,10 @@ mod tests {
         let mut doc = document(&pages);
         let mut spec = ScanSpec::default();
         let default_width = probe(&mut doc, &spec).unwrap().width.unwrap();
-        assert!((default_width - 288.0).abs() < 0.01, "灰度默认 300：{default_width}");
+        assert!((default_width - 288.0).abs() < 0.05, "灰度默认 300：{default_width}");
         spec.gray_ppi = 600.0;
         let strict = probe(&mut doc, &spec).unwrap().width.unwrap();
-        assert!((strict - 144.0).abs() < 0.01, "灰度提到 600：{strict}");
+        assert!((strict - 144.0).abs() < 0.05, "灰度提到 600：{strict}");
     }
 
     #[test]
@@ -523,6 +689,6 @@ mod tests {
             ..ScanSpec::default()
         };
         let width = probe(&mut doc, &spec).unwrap().width.unwrap();
-        assert!((width - 120.0).abs() < 0.01, "{width}");
+        assert!((width - 120.0).abs() < 0.05, "{width}");
     }
 }

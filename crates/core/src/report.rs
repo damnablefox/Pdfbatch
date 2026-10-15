@@ -50,6 +50,10 @@ pub struct LogRecord {
     pub reason: String,
     /// 处理后的页面尺寸，如 `595.28×841.89`；没有就是空串。
     pub size: String,
+    /// 扫描件适配的统一页宽（点），如 `187.08`；没有就是空串。
+    pub scan_width: String,
+    /// 该页所有图像的最小实际 PPI，如 `600.21`；没有就是空串。
+    pub min_ppi: String,
 }
 
 /// 把执行结果整理成日志记录。
@@ -73,6 +77,15 @@ pub fn collect(outcomes: &[Outcome]) -> Vec<LogRecord> {
                             .size
                             .map(|(w, h)| format!("{:.2}×{:.2}", w, h))
                             .unwrap_or_default(),
+                        // 扫描件适配的统一页宽与该页实测最小 PPI 都只在扫描件时才有值。
+                        scan_width: record
+                            .scan_width
+                            .map(|value| format!("{value:.2}"))
+                            .unwrap_or_default(),
+                        min_ppi: record
+                            .min_ppi
+                            .map(|value| format!("{value:.2}"))
+                            .unwrap_or_default(),
                     });
                 }
             }
@@ -83,6 +96,8 @@ pub fn collect(outcomes: &[Outcome]) -> Vec<LogRecord> {
                 result: "成功".to_string(),
                 reason: note.summary.clone(),
                 size: String::new(),
+                scan_width: String::new(),
+                min_ppi: String::new(),
             }),
             OutcomeStatus::Skipped(why) => out.push(LogRecord {
                 file,
@@ -91,6 +106,8 @@ pub fn collect(outcomes: &[Outcome]) -> Vec<LogRecord> {
                 result: "跳过".to_string(),
                 reason: why.clone(),
                 size: String::new(),
+                scan_width: String::new(),
+                min_ppi: String::new(),
             }),
             OutcomeStatus::Failed(error) => out.push(LogRecord {
                 file,
@@ -99,6 +116,8 @@ pub fn collect(outcomes: &[Outcome]) -> Vec<LogRecord> {
                 result: "失败".to_string(),
                 reason: error.to_string(),
                 size: String::new(),
+                scan_width: String::new(),
+                min_ppi: String::new(),
             }),
         }
     }
@@ -142,7 +161,7 @@ fn file_name(path: &Path) -> String {
 }
 
 fn render_csv(records: &[LogRecord]) -> String {
-    let mut out = String::from("文件名,完整路径,页码,结果,原因,新页面尺寸\n");
+    let mut out = String::from("文件名,完整路径,页码,结果,原因,新页面尺寸,统一页宽,最小实际PPI\n");
     for record in records {
         let page = record.page.map(|p| p.to_string()).unwrap_or_default();
         out.push_str(&csv_field(&record.file));
@@ -156,6 +175,10 @@ fn render_csv(records: &[LogRecord]) -> String {
         out.push_str(&csv_field(&record.reason));
         out.push(',');
         out.push_str(&csv_field(&record.size));
+        out.push(',');
+        out.push_str(&csv_field(&record.scan_width));
+        out.push(',');
+        out.push_str(&csv_field(&record.min_ppi));
         out.push('\n');
     }
     out
@@ -171,7 +194,9 @@ fn render_json(records: &[LogRecord]) -> String {
         out.push_str(&format!("    \"page\": {page},\n"));
         out.push_str(&format!("    \"result\": \"{}\",\n", json_escape(&record.result)));
         out.push_str(&format!("    \"reason\": \"{}\",\n", json_escape(&record.reason)));
-        out.push_str(&format!("    \"size\": \"{}\"\n", json_escape(&record.size)));
+        out.push_str(&format!("    \"size\": \"{}\",\n", json_escape(&record.size)));
+        out.push_str(&format!("    \"scan_width\": \"{}\",\n", json_escape(&record.scan_width)));
+        out.push_str(&format!("    \"min_ppi\": \"{}\"\n", json_escape(&record.min_ppi)));
         out.push_str(if index + 1 == records.len() { "  }\n" } else { "  },\n" });
     }
     out.push_str("]\n");
@@ -246,6 +271,9 @@ mod tests {
             result: result.to_string(),
             reason: reason.to_string(),
             size: size.to_string(),
+            // 这两列只在扫描件适配时才有值，这里统一留空。
+            scan_width: String::new(),
+            min_ppi: String::new(),
         }
     }
 
@@ -256,7 +284,10 @@ mod tests {
             record(None, "跳过", "没有对应的书签段", ""),
         ];
         let text = render(&records, LogFormat::Csv);
-        assert!(text.starts_with("文件名,完整路径,页码,结果,原因,新页面尺寸\n"), "{text}");
+        assert!(
+            text.starts_with("文件名,完整路径,页码,结果,原因,新页面尺寸,统一页宽,最小实际PPI\n"),
+            "{text}"
+        );
         assert!(text.contains("a.pdf,D:/x/a.pdf,1,成功"), "{text}");
         assert!(text.contains("a.pdf,D:/x/a.pdf,,跳过"), "{text}");
 
@@ -264,6 +295,19 @@ mod tests {
         let tricky = vec![record(None, "失败", "读不到文件, 已跳过", "")];
         let text = render(&tricky, LogFormat::Csv);
         assert!(text.contains("\"读不到文件, 已跳过\""), "{text}");
+    }
+
+    /// 扫描件适配的两列：统一页宽与最小实际 PPI。
+    #[test]
+    fn scan_columns_carry_the_width_and_ppi() {
+        let mut sample = record(Some(1), "成功", "贴合图像", "187.08×284.16");
+        sample.scan_width = "187.08".to_string();
+        sample.min_ppi = "600.21".to_string();
+        let csv = render(std::slice::from_ref(&sample), LogFormat::Csv);
+        assert!(csv.contains("187.08×284.16,187.08,600.21"), "{csv}");
+        let json = render(&[sample], LogFormat::Json);
+        assert!(json.contains("\"scan_width\": \"187.08\""), "{json}");
+        assert!(json.contains("\"min_ppi\": \"600.21\""), "{json}");
     }
 
     #[test]

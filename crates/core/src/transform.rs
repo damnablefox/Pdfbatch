@@ -166,11 +166,16 @@ fn open_content(matrix: Matrix) -> Vec<u8> {
     .into_bytes()
 }
 
-/// PDF 里数字的紧凑写法：最多四位小数，去掉多余的零。
+/// PDF 里数字的紧凑写法：最多六位小数，去掉多余的零。
+///
+/// 位数不能太少：内容流里的 `cm` 矩阵就是**实际的缩放系数**。若四舍五入到 4 位小数，
+/// 接近 1 的系数会被写成 `1`、接近 0.5 的写成 `0.5`，内容就被多放大零点几个千分点——
+/// 在扫描件适配里表现为"实际 PPI 略低于设定值"。
 fn num(value: f64) -> String {
-    let text = format!("{value:.4}");
+    let text = format!("{value:.6}");
     let trimmed = text.trim_end_matches('0').trim_end_matches('.');
-    if trimmed.is_empty() || trimmed == "-" {
+    // `-0.000000` 去掉尾零后是 `-0`：负零没有意义，统一写成 `0`，免得写出难看的 `-0`。
+    if trimmed.is_empty() || trimmed == "-" || trimmed == "-0" {
         "0".to_string()
     } else {
         trimmed.to_string()
@@ -181,6 +186,16 @@ fn num(value: f64) -> String {
 mod tests {
     use super::*;
     use pdfcraft_cos::{Dict, Object};
+
+    /// 数字精度：接近 1 的缩放系数不能被压成 1，否则实际 PPI 会低于设定值。
+    #[test]
+    fn scale_numbers_keep_enough_precision() {
+        assert_eq!(num(0.99997), "0.99997");
+        assert_eq!(num(0.3333333333), "0.333333");
+        assert_eq!(num(1.0), "1");
+        assert_eq!(num(0.5), "0.5");
+        assert_eq!(num(-0.0), "0");
+    }
 
     #[test]
     fn translate_then_scale_reads_left_to_right() {

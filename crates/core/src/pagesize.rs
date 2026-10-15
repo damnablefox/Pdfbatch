@@ -426,7 +426,7 @@ mod tests {
         let page = the_page(&doc);
         assert_eq!(page.crop(&doc), [0.0, 0.0, 400.0, 400.0]);
         // 原 200×300 按 min(2, 1.333) = 1.333 缩放：高度铺满，宽度居中留白。
-        assert!(matrix_text(&mut doc).contains("1.3333 0 0 1.3333 66.6667 0 cm"));
+        assert!(matrix_text(&mut doc).contains("1.333333 0 0 1.333333 66.666667 0 cm"));
     }
 
     #[test]

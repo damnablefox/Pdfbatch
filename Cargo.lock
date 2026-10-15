@@ -2133,7 +2133,7 @@ dependencies = [
 
 [[package]]
 name = "pdfbatch"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "eframe",
  "pdfbatch-ui",
@@ -2142,14 +2142,14 @@ dependencies = [
 
 [[package]]
 name = "pdfbatch-cli"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "pdfbatch-core",
 ]
 
 [[package]]
 name = "pdfbatch-core"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "pdfcraft-content",
  "pdfcraft-cos",
@@ -2160,7 +2160,7 @@ dependencies = [
 
 [[package]]
 name = "pdfbatch-ui"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "eframe",
  "egui",
