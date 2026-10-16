@@ -15,6 +15,9 @@ pub mod fill;
 pub mod pages;
 pub mod pagesize;
 pub mod pdf;
+// 执行层与记录层：只在 crate 内部使用，对外仍经 `action` 重新导出。
+mod pipeline;
+mod record;
 pub mod report;
 pub mod scan;
 pub mod spec;

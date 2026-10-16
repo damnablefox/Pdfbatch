@@ -107,6 +107,10 @@ your-workspace/
 
 Windows 便携版用**静态 CRT** 构建（`RUSTFLAGS=-C target-feature=+crt-static`），在没有安装 VC++ 运行库的机器上也能直接运行。
 
+### 依赖白名单
+
+pdfbatch 只依赖 PdfCraft 的**地基与模型**这 4 个库 crate：`cos`、`content`、`organize`、`model`（以及它们带入的 `filters`、`crypt`）。**不要**引入 `engine`、`ui-egui`、`render`、`ocr`、`js`、`print`、`sign` 等上层 crate——那会把整棵引擎依赖树（含 hayro、lopdf、ONNX 模型）拖进本项目的构建，编译时间与二进制体积都会明显变大。取舍理由见 `分析方案文档/PdfCraft与PdfBatch架构分析及目录重构方案.md`。
+
 ## 图形界面
 
 双击 `pdfbatch.exe` 运行。窗口分四块：

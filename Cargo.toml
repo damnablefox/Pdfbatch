@@ -10,7 +10,7 @@ resolver = "3"
 members = ["crates/*", "apps/*"]
 
 [workspace.package]
-version = "0.5.1"
+version = "0.5.2"
 edition = "2024"
 rust-version = "1.90"
 license = "MIT OR Apache-2.0"
@@ -18,11 +18,13 @@ description = "Batch bookmarks and coloured fill layers for PDFs, built on PdfCr
 
 [workspace.dependencies]
 # PdfCraft 的库 crate（相对 workspace 根解析）。
+# 依赖白名单：只允许底下这一组「地基 + 模型」crate（cos/content/organize/model + 它们的
+# 传递依赖 filters/crypt）。禁止引入 engine / ui-egui / render / ocr / js / print / sign 等，
+# 否则会把整棵引擎依赖树（含 hayro、lopdf、ONNX 模型）拖进 pdfbatch 的构建。
 pdfcraft-cos = { path = "../pdfcraft/crates/cos" }
 pdfcraft-content = { path = "../pdfcraft/crates/content" }
 pdfcraft-organize = { path = "../pdfcraft/crates/organize" }
 pdfcraft-model = { path = "../pdfcraft/crates/model" }
-pdfcraft-geom = { path = "../pdfcraft/crates/geom" }
 
 thiserror = "2"
 
