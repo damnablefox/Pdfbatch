@@ -1,7 +1,9 @@
 //! 把书签规格写进 PDF。
 
 use pdfcraft_cos::Document;
-use pdfcraft_organize::{add_bookmark, bookmarks, delete_bookmark, set_bookmark_open};
+use pdfcraft_organize::{
+    add_bookmark, delete_bookmark, set_bookmark_open, top_level_bookmarks,
+};
 
 use crate::error::Result;
 use crate::spec::SpecEntry;
@@ -40,7 +42,9 @@ fn insert(doc: &mut Document, parent_path: &[usize], index: usize, entry: &SpecE
 
 /// 删除全部顶层书签（连带各自的子书签）。
 fn clear_all(doc: &mut Document) -> Result<()> {
-    let top_level = bookmarks(doc).len();
+    // 用 `top_level_bookmarks` 而不是 `bookmarks`：后者的新版语义是「列出全部层级」，
+    // 拿它当顶层计数会多删（每删掉一个顶层项就可能连带把计数算进去的子项也数了一遍）。
+    let top_level = top_level_bookmarks(doc).len();
     for _ in 0..top_level {
         delete_bookmark(doc, &[0])?;
     }
@@ -50,6 +54,8 @@ fn clear_all(doc: &mut Document) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `bookmarks` 只被测试用到（生产代码改用 `top_level_bookmarks`），所以在这里显式引入。
+    use pdfcraft_organize::bookmarks;
     use crate::spec::parse_spec;
 
     /// 建一个最小可用的 PDF 骨架：一个 /Pages 节点和两张空页。
@@ -95,11 +101,16 @@ mod tests {
         let added = apply(&mut doc, &parsed.entries, true).unwrap();
         assert_eq!(added, 3);
 
-        let tree = bookmarks(&doc);
+        // 书签现在是扁平列表：`top_level_bookmarks` 只给顶层，其余项带 `path` 表示层级。
+        let tree = top_level_bookmarks(&doc);
         assert_eq!(tree.len(), 2);
         assert_eq!(tree[0].title, "第一章");
-        assert_eq!(tree[0].children.len(), 1);
-        assert_eq!(tree[0].children[0].title, "1.1");
+        let all = bookmarks(&doc);
+        let child = all
+            .iter()
+            .find(|b| b.path.as_slice() == [0, 0])
+            .expect("第一章应当有一个子书签");
+        assert_eq!(child.title, "1.1");
         assert!(tree[0].open, "有子书签的条目应当展开");
         assert_eq!(tree[1].title, "第二章");
     }

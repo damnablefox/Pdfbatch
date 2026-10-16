@@ -2133,7 +2133,7 @@ dependencies = [
 
 [[package]]
 name = "pdfbatch"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "eframe",
  "pdfbatch-ui",
@@ -2142,14 +2142,14 @@ dependencies = [
 
 [[package]]
 name = "pdfbatch-cli"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "pdfbatch-core",
 ]
 
 [[package]]
 name = "pdfbatch-core"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "pdfcraft-content",
  "pdfcraft-cos",
@@ -2160,7 +2160,7 @@ dependencies = [
 
 [[package]]
 name = "pdfbatch-ui"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "eframe",
  "egui",
@@ -2173,14 +2173,14 @@ dependencies = [
 
 [[package]]
 name = "pdfcraft-content"
-version = "0.5.0"
+version = "0.8.0"
 dependencies = [
  "pdfcraft-cos",
 ]
 
 [[package]]
 name = "pdfcraft-cos"
-version = "0.5.0"
+version = "0.8.0"
 dependencies = [
  "pdfcraft-crypt",
  "pdfcraft-filters",
@@ -2189,7 +2189,7 @@ dependencies = [
 
 [[package]]
 name = "pdfcraft-crypt"
-version = "0.5.0"
+version = "0.8.0"
 dependencies = [
  "aes",
  "md-5",
@@ -2200,7 +2200,7 @@ dependencies = [
 
 [[package]]
 name = "pdfcraft-filters"
-version = "0.5.0"
+version = "0.8.0"
 dependencies = [
  "flate2",
  "thiserror 2.0.21",
@@ -2208,14 +2208,14 @@ dependencies = [
 
 [[package]]
 name = "pdfcraft-model"
-version = "0.5.0"
+version = "0.8.0"
 dependencies = [
  "pdfcraft-cos",
 ]
 
 [[package]]
 name = "pdfcraft-organize"
-version = "0.5.0"
+version = "0.8.0"
 dependencies = [
  "pdfcraft-content",
  "pdfcraft-cos",
